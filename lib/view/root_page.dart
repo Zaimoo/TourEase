@@ -22,7 +22,6 @@ class RootPage extends StatefulWidget {
   State<RootPage> createState() => _RootPageState();
 }
 
-
 class _RootPageState extends State<RootPage> {
   late int _selectedIndex;
 
@@ -43,9 +42,10 @@ class _RootPageState extends State<RootPage> {
         return const DiscoverScreen();
 
       case 1:
-        final showDestination = _destinationData != null && _cameraTarget != null;
+        final showDestination =
+            _destinationData != null && _cameraTarget != null;
 
-        final mapScreen = MapScreen(
+        return MapScreen(
           showDestinationCard: showDestination,
           destinationData: _destinationData,
           initialCameraTarget: _cameraTarget,
@@ -58,14 +58,10 @@ class _RootPageState extends State<RootPage> {
           },
         );
 
-        return mapScreen;
-
-
       default:
         return const SizedBox.shrink();
     }
   }
-
 
   @override
   Widget build(BuildContext context) {
@@ -75,20 +71,17 @@ class _RootPageState extends State<RootPage> {
         height: 70,
         backgroundColor: Colors.white,
         indicatorColor: Color(0xFFB6DCFE),
-
         selectedIndex: _selectedIndex,
         onDestinationSelected: (index) => {
-        _selectedIndex = index,
+          _selectedIndex = index,
           setState(() {
-        print('Selected Index: $_selectedIndex');
+            print('Selected Index: $_selectedIndex');
           })
-
         },
         destinations: [
-        NavigationDestination(icon: Icon(Icons.home), label: 'Discover'),
-        NavigationDestination(icon: Icon(Icons.map), label: 'Map'),
-      ],
-
+          NavigationDestination(icon: Icon(Icons.home), label: 'Discover'),
+          NavigationDestination(icon: Icon(Icons.map), label: 'Map'),
+        ],
       ),
     );
   }

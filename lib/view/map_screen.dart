@@ -27,6 +27,27 @@ import 'package:tourease/widgets/custom_drawer.dart';
 import '../models/jeepneyRoute.dart';
 import 'favorites_screen.dart';
 
+/// Lightweight holder for active navigation state.
+/// Stored in a static field so it survives MapScreen rebuilds (tab switches)
+/// without keeping heavy native views (Google Maps) in memory.
+class _SavedNavState {
+  final List<Map<String, dynamic>> tasks;
+  final int currentTaskIndex;
+  final Destination? selectedDestination;
+  final Set<Polyline> polylines;
+  final LatLng? userLocation;
+  final String? selectedRouteType;
+
+  _SavedNavState({
+    required this.tasks,
+    required this.currentTaskIndex,
+    this.selectedDestination,
+    required this.polylines,
+    this.userLocation,
+    this.selectedRouteType,
+  });
+}
+
 class MapScreen extends StatefulWidget {
   final bool showDestinationCard;
   final Map<String, dynamic>? destinationData;
@@ -116,6 +137,63 @@ class _MapScreenState extends State<MapScreen>
   String _searchQuery = '';
   Timer? _searchDebounce;
 
+  // Custom starting location
+  LatLng? _customStartLocation;
+  bool _usingCustomStart = false;
+
+  // Static navigation state that persists across tab switches
+  static _SavedNavState? _savedNavState;
+
+  /// Save current navigation state to static holder (called on dispose)
+  void _saveNavState() {
+    if (_currentTask != null && _tasks.isNotEmpty) {
+      _savedNavState = _SavedNavState(
+        tasks: List<Map<String, dynamic>>.from(_tasks),
+        currentTaskIndex: _currentTaskIndex,
+        selectedDestination: _selectedDestination,
+        polylines: Set<Polyline>.from(_polylines),
+        userLocation: _userLocation,
+        selectedRouteType: _selectedRouteType,
+      );
+      print(
+          '💾 Navigation state saved (task $_currentTaskIndex/${_tasks.length})');
+    }
+  }
+
+  /// Restore navigation state from static holder (called on initState)
+  void _restoreNavState() {
+    final saved = _savedNavState;
+    if (saved == null) return;
+
+    _tasks = saved.tasks;
+    _currentTaskIndex = saved.currentTaskIndex;
+    _selectedDestination = saved.selectedDestination;
+    _polylines = saved.polylines;
+    _userLocation = saved.userLocation ?? _userLocation;
+    _selectedRouteType = saved.selectedRouteType;
+
+    // Restore task UI fields
+    if (_currentTaskIndex < _tasks.length) {
+      final task = _tasks[_currentTaskIndex];
+      _currentTask = task["title"];
+      _shortTaskDescription = task["shortDescription"];
+      _longTaskDescription = task["longDescription"];
+      _currentTaskTarget = task["target"];
+    }
+
+    // Clear the saved state so it's not re-applied
+    _savedNavState = null;
+    print(
+        '♻️ Navigation state restored (task $_currentTaskIndex/${_tasks.length})');
+
+    // Restart GPS tracking after a short delay (let the map initialize first)
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (!_disposed && mounted && _currentTask != null) {
+        _startTaskTracking();
+      }
+    });
+  }
+
   @override
   void initState() {
     super.initState();
@@ -123,6 +201,7 @@ class _MapScreenState extends State<MapScreen>
     if (widget.userLocation != null) {
       _userLocation = widget.userLocation;
     }
+    _restoreNavState();
     _loadDestinations();
     _loadTransportationMarkers();
     loadUserProfile();
@@ -131,6 +210,8 @@ class _MapScreenState extends State<MapScreen>
   @override
   void dispose() {
     _disposed = true;
+    // Save active navigation before disposing
+    _saveNavState();
     _positionSub?.cancel();
     _positionSubscription?.cancel();
     _taskCheckTimer?.cancel();
@@ -165,7 +246,7 @@ class _MapScreenState extends State<MapScreen>
 
     setState(() {
       _center = newCenter;
-      LatLng? _userLocation;
+      _userLocation = newCenter;
     });
 
     mapController?.animateCamera(
@@ -616,12 +697,13 @@ class _MapScreenState extends State<MapScreen>
     return nearestHabal;
   }
 
-  Future<List<LatLng>> _fetchPolyline(LatLng origin, LatLng destination) async {
+  Future<List<LatLng>> _fetchPolyline(LatLng origin, LatLng destination,
+      {String mode = "driving"}) async {
     const String apiKey = "AIzaSyALUtzfv48mrHdqP1PuSk36jwPKlddxSYk";
     final String url = "https://maps.googleapis.com/maps/api/directions/json"
         "?origin=${origin.latitude},${origin.longitude}"
         "&destination=${destination.latitude},${destination.longitude}"
-        "&mode=driving"
+        "&mode=$mode"
         "&key=$apiKey";
 
     final response = await http.get(Uri.parse(url));
@@ -744,28 +826,57 @@ class _MapScreenState extends State<MapScreen>
   }
 
   void _onFinalTaskCompleted() async {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('You’ve reached your destination!')),
-    );
+    // Cancel tracking timers immediately
+    _positionSub?.cancel();
+    _taskCheckTimer?.cancel();
+
+    // Capture trip data before clearing state
+    final destination = _selectedDestination;
+    final user = _currentUser;
+    final polylines = Set<Polyline>.from(_polylines);
+    final userLoc = _userLocation;
+
+    // Clear task state so the UI stops showing the task card
+    if (!_disposed && mounted) {
+      setState(() {
+        _currentTask = null;
+        _shortTaskDescription = null;
+        _longTaskDescription = null;
+        _currentTaskTarget = null;
+        _tasks.clear();
+        _polylines.clear();
+        _currentTaskIndex = 0;
+      });
+    }
+
+    // Clear any saved nav state since we completed
+    _savedNavState = null;
+
+    if (!_disposed && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('You\u2019ve reached your destination!')),
+      );
+    }
+
     // Save trip to history
-    if (_currentUser != null && _selectedDestination != null) {
+    if (user != null && destination != null) {
       try {
         // Calculate total distance traveled
         double? totalDistance;
-        if (_userLocation != null) {
+        if (userLoc != null) {
           totalDistance = Geolocator.distanceBetween(
-                _userLocation!.latitude,
-                _userLocation!.longitude,
-                _selectedDestination!.latLng.latitude,
-                _selectedDestination!.latLng.longitude,
+                userLoc.latitude,
+                userLoc.longitude,
+                destination.latLng.latitude,
+                destination.latLng.longitude,
               ) /
               1000; // Convert to km
         }
 
         // Determine transport mode from polyline colors or default
         String transportMode = 'Mixed';
-        if (_polylines.isNotEmpty) {
-          final colors = _polylines.map((p) => p.color).toSet();
+        if (polylines.isNotEmpty) {
+          final colors = polylines.map((p) => p.color).toSet();
           if (colors.length == 1) {
             final color = colors.first;
             if (color == Colors.orange)
@@ -781,17 +892,17 @@ class _MapScreenState extends State<MapScreen>
 
         final trip = Trip(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
-          destinationName: _selectedDestination!.name,
-          destinationId: _selectedDestination!.name,
+          destinationName: destination.name,
+          destinationId: destination.name,
           visitedDate: DateTime.now(),
-          imageUrl: _selectedDestination!.imageUrl,
+          imageUrl: destination.imageUrl,
           distance: totalDistance,
           transportMode: transportMode,
         );
 
         await tripService.addToSubcollection(
           'users',
-          _currentUser!.id,
+          user.id,
           'trips',
           trip.id,
           trip,
@@ -801,6 +912,13 @@ class _MapScreenState extends State<MapScreen>
       } catch (e) {
         print('❌ Error saving trip: $e');
       }
+    }
+
+    // Zoom back to user location
+    if (_userLocation != null && mapController != null) {
+      mapController?.animateCamera(
+        CameraUpdate.newLatLngZoom(_userLocation!, 15),
+      );
     }
   }
 
@@ -830,6 +948,13 @@ class _MapScreenState extends State<MapScreen>
   }
 
   void _stopCurrentTask() {
+    // Cancel tracking timers
+    _positionSub?.cancel();
+    _taskCheckTimer?.cancel();
+
+    // Clear any saved nav state
+    _savedNavState = null;
+
     setState(() {
       _tasks.clear();
       _polylines.clear();
@@ -837,6 +962,7 @@ class _MapScreenState extends State<MapScreen>
       _shortTaskDescription = null;
       _longTaskDescription = null;
       _currentTaskTarget = null;
+      _currentTaskIndex = 0;
     });
 
     ScaffoldMessenger.of(context).showSnackBar(
@@ -899,8 +1025,22 @@ class _MapScreenState extends State<MapScreen>
   Future<void> _updatePolylinesForUserPosition(LatLng userPos) async {
     if (_polylines.isEmpty || _currentTaskTarget == null) return;
 
-    // 1. Trim all polylines to remove passed points
+    // 1. Trim polylines to remove passed points — but only trim
+    //    polylines the user is actually close to (within 300 m of at
+    //    least one vertex). Future polylines stay untouched.
     final trimmedPolylines = _polylines.map((polyline) {
+      // Check if user is close enough to this polyline to warrant trimming
+      bool isNearby = polyline.points.any((pt) {
+        final d = Geolocator.distanceBetween(
+          userPos.latitude,
+          userPos.longitude,
+          pt.latitude,
+          pt.longitude,
+        );
+        return d < 300; // 300 m threshold
+      });
+      if (!isNearby) return polyline; // leave future polylines untouched
+
       final trimmed = _trimPolyline(polyline.points, userPos);
       return polyline.copyWith(pointsParam: trimmed);
     }).toSet();
@@ -1053,25 +1193,40 @@ class _MapScreenState extends State<MapScreen>
       throw Exception("No jeepney routes found.");
     }
 
-    // Helper to find the closest point on any route
-    double _minDistanceToRoute(JeepneyRoute route, LatLng point) {
+    // Helper: find closest point on a route and return (distance_km, index)
+    ({double distKm, int index}) _nearestPointInfo(
+        JeepneyRoute route, LatLng point) {
       double minDist = double.infinity;
-      for (final routePoint in route.points) {
+      int bestIdx = 0;
+      for (int i = 0; i < route.points.length; i++) {
+        final rp = route.points[i];
         final d = Geolocator.distanceBetween(
-          routePoint.latitude,
-          routePoint.longitude,
+          rp.latitude,
+          rp.longitude,
           point.latitude,
           point.longitude,
         );
-        if (d < minDist) minDist = d;
+        if (d < minDist) {
+          minDist = d;
+          bestIdx = i;
+        }
       }
-      return minDist / 1000; // Convert meters to kilometers
+      return (distKm: minDist / 1000, index: bestIdx);
     }
 
-    // Maximum acceptable distance from route (in km)
-    const maxDistanceFromRoute = 3.0; // Increased to 3km for more flexibility
+    double _minDistanceToRoute(JeepneyRoute route, LatLng point) {
+      return _nearestPointInfo(route, point).distKm;
+    }
 
-    // 1️⃣ Try to find a single route that can serve both points
+    // Maximum acceptable walking distance from a route stop (in km)
+    const maxWalkToRoute = 1.5;
+
+    // ─── 1️⃣ Try to find a single route that serves both points ───
+    // A single route is valid ONLY if:
+    //   (a) Both origin & destination are within walking distance of the route
+    //   (b) The nearest stop to origin comes BEFORE the nearest stop to
+    //       destination in the route's point sequence (i.e. the jeepney is
+    //       heading in the right direction)
     JeepneyRoute? bestSingleRoute;
     double bestSingleRouteScore = double.infinity;
 
@@ -1082,56 +1237,63 @@ class _MapScreenState extends State<MapScreen>
     print("🎯 Destination: ${destination.latitude}, ${destination.longitude}");
 
     for (final route in jeepneyRoutes) {
-      final distToUser = _minDistanceToRoute(route, userLocation);
-      final distToDest = _minDistanceToRoute(route, destination);
+      final userInfo = _nearestPointInfo(route, userLocation);
+      final destInfo = _nearestPointInfo(route, destination);
 
       print("\n🚍 Checking ${route.name}:");
-      print("   User distance: ${distToUser.toStringAsFixed(2)}km");
-      print("   Dest distance: ${distToDest.toStringAsFixed(2)}km");
+      print(
+          "   User distance: ${userInfo.distKm.toStringAsFixed(2)}km (index ${userInfo.index})");
+      print(
+          "   Dest distance: ${destInfo.distKm.toStringAsFixed(2)}km (index ${destInfo.index})");
 
-      // Both points must be reasonably close to the route
-      if (distToUser < maxDistanceFromRoute &&
-          distToDest < maxDistanceFromRoute) {
-        print("   ✓ Both within ${maxDistanceFromRoute}km");
-
-        // Calculate actual jeepney ride distance (approximate)
-        // This is the distance user needs to travel on the jeepney
-        final jeepneyRideDistance = calculateDistance(
-          userLocation.latitude,
-          userLocation.longitude,
-          destination.latitude,
-          destination.longitude,
-        );
-
-        // Calculate fare for this jeepney ride
-        final fare = calculateJeepneyFare(jeepneyRideDistance);
-
-        // Score based on weighted fare + distance (6:4 ratio)
-        final score = calculateRouteScore(
-            distToUser + distToDest + jeepneyRideDistance, fare,
-            mode: "jeepney");
-        print("   💰 Fare: ₱${fare.toStringAsFixed(0)}");
-        print("   📊 Score: ${score.toStringAsFixed(2)}");
-
-        if (score < bestSingleRouteScore) {
-          bestSingleRouteScore = score;
-          bestSingleRoute = route;
-          print("   ⭐ New best route!");
-        }
-      } else {
+      // (a) Both within walking distance
+      if (userInfo.distKm > maxWalkToRoute ||
+          destInfo.distKm > maxWalkToRoute) {
         print("   ✗ Too far from route");
+        continue;
+      }
+
+      // (b) Direction check — user's stop must come before destination's stop
+      if (userInfo.index >= destInfo.index) {
+        print(
+            "   ✗ Wrong direction (user index ${userInfo.index} >= dest index ${destInfo.index})");
+        continue;
+      }
+
+      print("   ✓ Valid single-ride candidate");
+
+      // Calculate the on-route ride distance (sum of segments between stops)
+      double rideDistKm = 0;
+      for (int i = userInfo.index; i < destInfo.index; i++) {
+        final p1 = route.points[i];
+        final p2 = route.points[i + 1];
+        rideDistKm += Geolocator.distanceBetween(
+              p1.latitude,
+              p1.longitude,
+              p2.latitude,
+              p2.longitude,
+            ) /
+            1000;
+      }
+
+      final fare = calculateJeepneyFare(rideDistKm);
+      // Score: total walk distance + ride distance, weighted with fare
+      final totalDist = userInfo.distKm + destInfo.distKm + rideDistKm;
+      final score = calculateRouteScore(totalDist, fare, mode: "jeepney");
+
+      print("   🚌 Ride: ${rideDistKm.toStringAsFixed(2)}km");
+      print("   💰 Fare: ₱${fare.toStringAsFixed(0)}");
+      print("   📊 Score: ${score.toStringAsFixed(2)}");
+
+      if (score < bestSingleRouteScore) {
+        bestSingleRouteScore = score;
+        bestSingleRoute = route;
+        print("   ⭐ New best route!");
       }
     }
 
-    // If we found a valid single route, use it
     if (bestSingleRoute != null) {
-      final distToUser = _minDistanceToRoute(bestSingleRoute, userLocation);
-      final distToDest = _minDistanceToRoute(bestSingleRoute, destination);
-
       print("✅ Single jeepney ride: ${bestSingleRoute.name}");
-      print("   📍 User distance: ${distToUser.toStringAsFixed(2)}km");
-      print("   🎯 Dest distance: ${distToDest.toStringAsFixed(2)}km");
-
       return {
         "type": "single",
         "routes": [bestSingleRoute],
@@ -1139,47 +1301,147 @@ class _MapScreenState extends State<MapScreen>
       };
     }
 
-    // 2️⃣ No single route works - find best double route combination
+    // ─── 2️⃣ No single route works — find best double-ride combination ───
     print("⚠️ No single route found, calculating double ride...");
 
-    // Find nearest route to user
-    jeepneyRoutes.sort((a, b) => _minDistanceToRoute(a, userLocation)
-        .compareTo(_minDistanceToRoute(b, userLocation)));
-    final nearestUserRoute = jeepneyRoutes.first;
+    // For each pair (routeA for origin, routeB for destination) find the pair
+    // whose transfer point is closest. Also enforce directionality on each leg.
+    double bestDoubleScore = double.infinity;
+    JeepneyRoute? bestRouteA;
+    JeepneyRoute? bestRouteB;
+    LatLng? bestTransfer;
 
-    // Find nearest route to destination
-    jeepneyRoutes.sort((a, b) => _minDistanceToRoute(a, destination)
-        .compareTo(_minDistanceToRoute(b, destination)));
-    final nearestDestinationRoute = jeepneyRoutes.first;
+    for (final routeA in jeepneyRoutes) {
+      final userInfoA = _nearestPointInfo(routeA, userLocation);
+      if (userInfoA.distKm > maxWalkToRoute * 2) continue; // generous limit
 
-    // Find connecting point between the two routes
-    double shortestConnection = double.infinity;
-    LatLng? transferPoint;
+      for (final routeB in jeepneyRoutes) {
+        if (routeB.id == routeA.id) continue; // skip same route
 
-    for (final p1 in nearestUserRoute.points) {
-      for (final p2 in nearestDestinationRoute.points) {
-        final d = Geolocator.distanceBetween(
-          p1.latitude,
-          p1.longitude,
-          p2.latitude,
-          p2.longitude,
-        );
-        if (d < shortestConnection) {
-          shortestConnection = d;
-          transferPoint = LatLng(p1.latitude, p1.longitude);
+        final destInfoB = _nearestPointInfo(routeB, destination);
+        if (destInfoB.distKm > maxWalkToRoute * 2) continue;
+
+        // Find closest connection between routeA and routeB
+        double bestConn = double.infinity;
+        int bestIdxA = -1;
+        int bestIdxB = -1;
+        LatLng? connPoint;
+
+        for (int iA = 0; iA < routeA.points.length; iA++) {
+          for (int iB = 0; iB < routeB.points.length; iB++) {
+            final pA = routeA.points[iA];
+            final pB = routeB.points[iB];
+            final d = Geolocator.distanceBetween(
+              pA.latitude,
+              pA.longitude,
+              pB.latitude,
+              pB.longitude,
+            );
+            if (d < bestConn) {
+              bestConn = d;
+              bestIdxA = iA;
+              bestIdxB = iB;
+              connPoint = LatLng(
+                (pA.latitude + pB.latitude) / 2,
+                (pA.longitude + pB.longitude) / 2,
+              );
+            }
+          }
+        }
+
+        if (connPoint == null) continue;
+
+        // Directionality: user must be before transfer on routeA,
+        // transfer must be before destination on routeB
+        if (userInfoA.index >= bestIdxA || bestIdxB >= destInfoB.index) {
+          continue; // wrong direction on one of the legs
+        }
+
+        // Calculate total distance & score
+        final walkToA = userInfoA.distKm;
+        double legADist = 0;
+        for (int i = userInfoA.index; i < bestIdxA; i++) {
+          final p1 = routeA.points[i];
+          final p2 = routeA.points[i + 1];
+          legADist += Geolocator.distanceBetween(
+                p1.latitude,
+                p1.longitude,
+                p2.latitude,
+                p2.longitude,
+              ) /
+              1000;
+        }
+        final transferWalk = bestConn / 1000;
+        double legBDist = 0;
+        for (int i = bestIdxB; i < destInfoB.index; i++) {
+          final p1 = routeB.points[i];
+          final p2 = routeB.points[i + 1];
+          legBDist += Geolocator.distanceBetween(
+                p1.latitude,
+                p1.longitude,
+                p2.latitude,
+                p2.longitude,
+              ) /
+              1000;
+        }
+        final walkFromB = destInfoB.distKm;
+
+        final totalDist =
+            walkToA + legADist + transferWalk + legBDist + walkFromB;
+        final totalFare =
+            calculateJeepneyFare(legADist) + calculateJeepneyFare(legBDist);
+        final score =
+            calculateRouteScore(totalDist, totalFare, mode: "jeepney");
+
+        if (score < bestDoubleScore) {
+          bestDoubleScore = score;
+          bestRouteA = routeA;
+          bestRouteB = routeB;
+          bestTransfer = connPoint;
         }
       }
     }
 
-    print(
-        "🔄 Double ride: ${nearestUserRoute.name} → ${nearestDestinationRoute.name}");
-    print(
-        "   🔄 Transfer distance: ${(shortestConnection / 1000).toStringAsFixed(2)}km");
+    // Fallback: if direction-aware search found nothing, use simple nearest
+    if (bestRouteA == null || bestRouteB == null || bestTransfer == null) {
+      print(
+          "⚠️ Direction-aware double ride failed, falling back to nearest routes");
+      jeepneyRoutes.sort((a, b) => _minDistanceToRoute(a, userLocation)
+          .compareTo(_minDistanceToRoute(b, userLocation)));
+      bestRouteA = jeepneyRoutes.first;
+
+      jeepneyRoutes.sort((a, b) => _minDistanceToRoute(a, destination)
+          .compareTo(_minDistanceToRoute(b, destination)));
+      bestRouteB = jeepneyRoutes.first;
+
+      // If same route was picked, try picking the second for destination
+      if (bestRouteB!.id == bestRouteA!.id && jeepneyRoutes.length > 1) {
+        bestRouteB = jeepneyRoutes[1];
+      }
+
+      double shortestConnection = double.infinity;
+      for (final p1 in bestRouteA!.points) {
+        for (final p2 in bestRouteB!.points) {
+          final d = Geolocator.distanceBetween(
+            p1.latitude,
+            p1.longitude,
+            p2.latitude,
+            p2.longitude,
+          );
+          if (d < shortestConnection) {
+            shortestConnection = d;
+            bestTransfer = LatLng(p1.latitude, p1.longitude);
+          }
+        }
+      }
+    }
+
+    print("🔄 Double ride: ${bestRouteA!.name} → ${bestRouteB!.name}");
 
     return {
       "type": "double",
-      "routes": [nearestUserRoute, nearestDestinationRoute],
-      "transferPoint": transferPoint,
+      "routes": [bestRouteA, bestRouteB],
+      "transferPoint": bestTransfer,
     };
   }
 
@@ -2616,6 +2878,145 @@ class _MapScreenState extends State<MapScreen>
     _setCurrentTask();
   }
 
+  /// Build tasks from already-computed route result (no duplicate Firestore call).
+  void _setupJeepneyTasksFromResult(
+    Map<String, dynamic> routeResult,
+    LatLng userLocation,
+    LatLng dest,
+    LatLng startPoint,
+  ) {
+    _tasks.clear();
+    final routes = routeResult["routes"] as List<JeepneyRoute>;
+    final type = routeResult["type"] as String;
+
+    if (type == "single") {
+      final firstRoute = routes[0];
+      final nearestToDest = _findNearestPoint(
+        firstRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
+        dest,
+      );
+
+      final jeepneyRideDistance = calculateDistance(
+        startPoint.latitude,
+        startPoint.longitude,
+        nearestToDest.latitude,
+        nearestToDest.longitude,
+      );
+      final jeepneyFare = calculateJeepneyFare(jeepneyRideDistance);
+
+      _tasks.add({
+        "title": "Walk to Jeepney Stop",
+        "shortDescription":
+            "Walk to the nearest pickup point for ${firstRoute.name}.",
+        "longDescription":
+            "Walk to ${firstRoute.name}'s pickup location to start your journey.\n\nUpcoming Fare: ₱${jeepneyFare.toStringAsFixed(0)}",
+        "target": startPoint,
+      });
+
+      _tasks.add({
+        "title": "Ride Jeepney",
+        "shortDescription":
+            "Ride ${firstRoute.name} to reach near your destination.",
+        "longDescription":
+            "Stay on ${firstRoute.name} until you're close to your destination.\n\nFare: ₱${jeepneyFare.toStringAsFixed(0)}\nDistance: ${jeepneyRideDistance.toStringAsFixed(1)}km.",
+        "target": nearestToDest,
+      });
+
+      final endDist = Geolocator.distanceBetween(
+        nearestToDest.latitude,
+        nearestToDest.longitude,
+        dest.latitude,
+        dest.longitude,
+      );
+      if (endDist > 50) {
+        _tasks.add({
+          "title": "Walk to Destination",
+          "shortDescription": "Walk the last few meters to your destination.",
+          "longDescription":
+              "You've reached near your destination — finish the last walk.",
+          "target": dest,
+        });
+      }
+    } else {
+      final firstRoute = routes[0];
+      final secondRoute = routes[1];
+      final transferPoint = routeResult["transferPoint"] as LatLng;
+
+      final nearestToDest = _findNearestPoint(
+        secondRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
+        dest,
+      );
+
+      final firstRouteDistance = calculateDistance(
+        startPoint.latitude,
+        startPoint.longitude,
+        transferPoint.latitude,
+        transferPoint.longitude,
+      );
+      final secondRouteDistance = calculateDistance(
+        transferPoint.latitude,
+        transferPoint.longitude,
+        nearestToDest.latitude,
+        nearestToDest.longitude,
+      );
+      final firstJeepneyFare = calculateJeepneyFare(firstRouteDistance);
+      final secondJeepneyFare = calculateJeepneyFare(secondRouteDistance);
+      final totalFare = firstJeepneyFare + secondJeepneyFare;
+
+      _tasks.add({
+        "title": "Walk to First Jeepney Stop",
+        "shortDescription":
+            "Walk to the nearest pickup point for ${firstRoute.name}.",
+        "longDescription":
+            "Start by walking to ${firstRoute.name}'s pickup stop.\n\nUpcoming Fare: ₱${totalFare.toStringAsFixed(0)} (₱${firstJeepneyFare.toStringAsFixed(0)} for ${firstRouteDistance.toStringAsFixed(1)}km + ₱${secondJeepneyFare.toStringAsFixed(0)} for ${secondRouteDistance.toStringAsFixed(1)}km)",
+        "target": startPoint,
+      });
+
+      _tasks.add({
+        "title": "Ride First Jeepney",
+        "shortDescription": "Ride ${firstRoute.name} to the transfer point.",
+        "longDescription":
+            "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\nFare: ₱${firstJeepneyFare.toStringAsFixed(0)}\nDistance: ${firstRouteDistance.toStringAsFixed(1)}km.",
+        "target": transferPoint,
+      });
+
+      _tasks.add({
+        "title": "Transfer Jeepney",
+        "shortDescription": "Transfer to ${secondRoute.name}.",
+        "longDescription":
+            "Switch to ${secondRoute.name} to continue your journey.\n\nUpcoming Fare: ₱${secondJeepneyFare.toStringAsFixed(0)}",
+        "target": transferPoint,
+      });
+
+      _tasks.add({
+        "title": "Ride Second Jeepney",
+        "shortDescription": "Ride ${secondRoute.name} near your destination.",
+        "longDescription":
+            "Ride ${secondRoute.name} close to your destination stop.\n\nFare: ₱${secondJeepneyFare.toStringAsFixed(0)}\nDistance: ${secondRouteDistance.toStringAsFixed(1)}km.",
+        "target": nearestToDest,
+      });
+
+      final endDist = Geolocator.distanceBetween(
+        nearestToDest.latitude,
+        nearestToDest.longitude,
+        dest.latitude,
+        dest.longitude,
+      );
+      if (endDist > 50) {
+        _tasks.add({
+          "title": "Walk to Destination",
+          "shortDescription": "Walk the last few meters to your destination.",
+          "longDescription":
+              "You've reached near your destination — finish the last walk.",
+          "target": dest,
+        });
+      }
+    }
+
+    _currentTaskIndex = 0;
+    _setCurrentTask();
+  }
+
   void _setupHabalTasks(
       LatLng userLocation, LatLng nearestHabal, LatLng destination) {
     final distance = Geolocator.distanceBetween(
@@ -2671,6 +3072,7 @@ class _MapScreenState extends State<MapScreen>
                       children: [
                         GoogleMap(
                           onMapCreated: _onMapCreated,
+                          onLongPress: _onMapLongPress,
                           initialCameraPosition: CameraPosition(
                             target: widget.initialCameraTarget ?? _center,
                             zoom: 16.0,
@@ -2681,13 +3083,15 @@ class _MapScreenState extends State<MapScreen>
                           polylines: _polylines,
                         ),
                         if (_showDestinationCard &&
-                            _selectedDestination != null)
+                            _selectedDestination != null &&
+                            _currentUser != null &&
+                            _userLocation != null)
                           Positioned(
                             bottom: 30,
                             left: 16,
                             right: 16,
                             child: DestinationCard(
-                              currentUser: _currentUser!,
+                              currentUser: _currentUser,
                               name: _selectedDestination!.name,
                               shortDescription:
                                   _selectedDestination!.shortDescription,
@@ -2717,35 +3121,6 @@ class _MapScreenState extends State<MapScreen>
                             ),
                           ),
                         if (_showDirectionsOptions) _buildDirectionsOptions(),
-                        if (!_showDirectionsOptions && _polylines.isNotEmpty)
-                          Positioned(
-                            bottom: 30,
-                            right: 16,
-                            child: FloatingActionButton.extended(
-                              heroTag: "change_route",
-                              onPressed: () {
-                                setState(() {
-                                  _showDirectionsOptions = true;
-                                  _polylines.clear();
-                                });
-
-                                // Zoom back to the destination
-                                if (_selectedDestination != null) {
-                                  final dest =
-                                      _selectedDestination!.coordinates;
-                                  mapController?.animateCamera(
-                                    CameraUpdate.newLatLngZoom(
-                                      LatLng(dest.latitude, dest.longitude),
-                                      16.5, // adjust zoom level if needed
-                                    ),
-                                  );
-                                }
-                              },
-                              label: const Text("Change Route"),
-                              icon: const Icon(Icons.swap_horiz),
-                              backgroundColor: Colors.blueAccent,
-                            ),
-                          ),
                         if (_currentTask != null)
                           Positioned(
                             bottom: 50,
@@ -2885,7 +3260,7 @@ class _MapScreenState extends State<MapScreen>
             curve: Curves.easeInOut,
             top: 0,
             bottom: 0,
-            left: _showDrawer ? 0 : -MediaQuery.of(context).size.width * 0.75,
+            right: _showDrawer ? 0 : -MediaQuery.of(context).size.width * 0.75,
             child: CustomDrawer(
               currentUser: _currentUser,
               onClose: () {
@@ -2898,11 +3273,7 @@ class _MapScreenState extends State<MapScreen>
                       builder: (context) => const SettingsScreen()),
                 );
               },
-              onLogout: () {
-                _authService.signOut();
-                Navigator.pushReplacement(context,
-                    MaterialPageRoute(builder: (context) => LoginScreen()));
-              },
+              onLogout: _handleLogout,
               onItemTap: (String page) {
                 _toggleDrawer();
                 switch (page) {
@@ -2966,13 +3337,57 @@ class _MapScreenState extends State<MapScreen>
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Row(
-            children: const [
-              Icon(Icons.location_on, size: 20),
-              SizedBox(width: 4),
-              Text("Tibanga, Iligan City",
-                  style: TextStyle(fontWeight: FontWeight.w600)),
-            ],
+          // Start location display with tap to change
+          GestureDetector(
+            onTap: _showSetStartLocationDialog,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: _usingCustomStart
+                    ? Colors.orange.withOpacity(0.1)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(20),
+                border: _usingCustomStart
+                    ? Border.all(color: Colors.orange.withOpacity(0.3))
+                    : null,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _usingCustomStart
+                        ? Icons.edit_location_alt
+                        : Icons.location_on,
+                    size: 20,
+                    color: _usingCustomStart ? Colors.orange : Colors.black,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _usingCustomStart ? "Custom Start" : "Tibanga, Iligan City",
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: _usingCustomStart ? Colors.orange : Colors.black,
+                    ),
+                  ),
+                  if (_usingCustomStart) ...[
+                    const SizedBox(width: 4),
+                    GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _usingCustomStart = false;
+                          _customStartLocation = null;
+                          // Remove custom marker
+                          _markers.removeWhere(
+                              (m) => m.markerId.value == 'custom_start');
+                        });
+                      },
+                      child: const Icon(Icons.close,
+                          size: 18, color: Colors.orange),
+                    ),
+                  ],
+                ],
+              ),
+            ),
           ),
           GestureDetector(
             onTap: _toggleDrawer,
@@ -2989,6 +3404,82 @@ class _MapScreenState extends State<MapScreen>
       ),
     );
   }
+
+  void _showSetStartLocationDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Text("Set Starting Location"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text("Choose how to set your starting location:"),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.my_location, color: Colors.blue),
+                title: const Text("Use Current Location"),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  setState(() {
+                    _usingCustomStart = false;
+                    _customStartLocation = null;
+                    _markers
+                        .removeWhere((m) => m.markerId.value == 'custom_start');
+                  });
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.touch_app, color: Colors.orange),
+                title: const Text("Tap on Map to Set"),
+                subtitle: const Text("Tap anywhere on the map"),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                          "Long press on the map to set your starting location"),
+                      duration: Duration(seconds: 3),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _onMapLongPress(LatLng position) {
+    setState(() {
+      _customStartLocation = position;
+      _usingCustomStart = true;
+      // Add custom start marker
+      _markers.removeWhere((m) => m.markerId.value == 'custom_start');
+      _markers.add(
+        Marker(
+          markerId: const MarkerId('custom_start'),
+          position: position,
+          icon:
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange),
+          infoWindow: const InfoWindow(title: 'Custom Start Location'),
+        ),
+      );
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text("Starting location set!"),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  /// Returns the effective start location (custom or user GPS)
+  LatLng? get _effectiveStartLocation =>
+      _usingCustomStart ? _customStartLocation : _userLocation;
 
   Widget _buildSearchBar() {
     return Padding(
@@ -3197,10 +3688,10 @@ class _MapScreenState extends State<MapScreen>
   Widget _buildSearchResultItem(Destination destination) {
     // Calculate distance if user location is available
     String? distanceText;
-    if (_userLocation != null) {
+    if (_effectiveStartLocation != null) {
       final distance = Geolocator.distanceBetween(
-            _userLocation!.latitude,
-            _userLocation!.longitude,
+            _effectiveStartLocation!.latitude,
+            _effectiveStartLocation!.longitude,
             destination.latLng.latitude,
             destination.latLng.longitude,
           ) /
@@ -3366,7 +3857,50 @@ class _MapScreenState extends State<MapScreen>
               ),
               const SizedBox(height: 10),
               Divider(color: Colors.grey[300]),
-              const SizedBox(height: 12),
+
+              // Estimated fare preview
+              if (_selectedDestination != null &&
+                  _effectiveStartLocation != null)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(top: 8, bottom: 4),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF0F8FF),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFFB6DCFE)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.payments_outlined,
+                          size: 20, color: Color(0xFF1E88E5)),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Builder(builder: (_) {
+                          final dist = calculateDistance(
+                            _effectiveStartLocation!.latitude,
+                            _effectiveStartLocation!.longitude,
+                            _selectedDestination!.latLng.latitude,
+                            _selectedDestination!.latLng.longitude,
+                          );
+                          final jeepFare = calculateJeepneyFare(dist);
+                          final habalFare = calculateHabalFare(dist);
+                          return Text(
+                            'Est. fare: Jeepney ₱${jeepFare.toStringAsFixed(0)} · Habal ₱${habalFare.toStringAsFixed(0)} · ${dist.toStringAsFixed(1)}km',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF1E88E5),
+                            ),
+                          );
+                        }),
+                      ),
+                    ],
+                  ),
+                ),
+
+              const SizedBox(height: 8),
 
               // Route Buttons
               Row(
@@ -3402,7 +3936,7 @@ class _MapScreenState extends State<MapScreen>
                           case "Multimodal":
                             print("🌐 Multimodal route started");
 
-                            final userLocation = _userLocation;
+                            final userLocation = _effectiveStartLocation;
                             final destination = _selectedDestination;
 
                             if (userLocation == null || destination == null)
@@ -3421,7 +3955,7 @@ class _MapScreenState extends State<MapScreen>
                           case "Jeepney":
                             print("🚎 Jeepney route started");
 
-                            final userLocation = _userLocation;
+                            final userLocation = _effectiveStartLocation;
                             final destination = _selectedDestination;
                             if (userLocation == null || destination == null)
                               return;
@@ -3437,8 +3971,9 @@ class _MapScreenState extends State<MapScreen>
                               userLocation,
                             );
 
-                            final userToJeepney =
-                                await _fetchPolyline(userLocation, startPoint);
+                            final userToJeepney = await _fetchPolyline(
+                                userLocation, startPoint,
+                                mode: "walking");
                             final polylines = <Polyline>{};
 
                             // 🟠 1️⃣ User → Jeepney pickup
@@ -3486,19 +4021,23 @@ class _MapScreenState extends State<MapScreen>
                               if (endDist > 50) {
                                 finalWalkStartPoint = nearestToDest;
                                 final finalWalk = await _fetchPolyline(
-                                    nearestToDest, destination.latLng);
-                                polylines.add(
-                                  Polyline(
-                                    polylineId: const PolylineId("final_walk"),
-                                    color: Colors.orange,
-                                    width: 6,
-                                    points: finalWalk,
-                                    patterns: [
-                                      PatternItem.dash(20),
-                                      PatternItem.gap(10)
-                                    ],
-                                  ),
-                                );
+                                    nearestToDest, destination.latLng,
+                                    mode: "walking");
+                                if (finalWalk.isNotEmpty) {
+                                  polylines.add(
+                                    Polyline(
+                                      polylineId:
+                                          const PolylineId("final_walk"),
+                                      color: Colors.orange,
+                                      width: 6,
+                                      points: finalWalk,
+                                      patterns: [
+                                        PatternItem.dash(20),
+                                        PatternItem.gap(10)
+                                      ],
+                                    ),
+                                  );
+                                }
                               }
                             } else {
                               // 🚎 Double ride
@@ -3547,37 +4086,29 @@ class _MapScreenState extends State<MapScreen>
                               if (endDist > 50) {
                                 finalWalkStartPoint = nearestToDest;
                                 final finalWalk = await _fetchPolyline(
-                                    nearestToDest, destination.latLng);
-                                polylines.add(
-                                  Polyline(
-                                    polylineId: const PolylineId("final_walk"),
-                                    color: Colors.orange,
-                                    width: 6,
-                                    points: finalWalk,
-                                    patterns: [
-                                      PatternItem.dash(20),
-                                      PatternItem.gap(10),
-                                    ],
-                                  ),
-                                );
+                                    nearestToDest, destination.latLng,
+                                    mode: "walking");
+                                if (finalWalk.isNotEmpty) {
+                                  polylines.add(
+                                    Polyline(
+                                      polylineId:
+                                          const PolylineId("final_walk"),
+                                      color: Colors.orange,
+                                      width: 6,
+                                      points: finalWalk,
+                                      patterns: [
+                                        PatternItem.dash(20),
+                                        PatternItem.gap(10),
+                                      ],
+                                    ),
+                                  );
+                                }
                               }
                             }
 
-                            // 🧩 Now set up dynamic tasks (Walk → Ride → maybe Walk again)
-                            await _setupJeepneyTasks(
-                                userLocation, destination.latLng);
-
-                            // If there’s a final walk (distance > 50 m), add it dynamically
-                            if (finalWalkStartPoint != null) {
-                              _tasks.add({
-                                "name": "Walk (Final)",
-                                "shortDescription":
-                                    "Walk from the last jeepney stop to your destination.",
-                                "longDescription":
-                                    "Final stretch — walk the remaining distance to your destination.",
-                                "target": destination.latLng,
-                              });
-                            }
+                            // 🧩 Set up tasks from the SAME routeResult (no duplicate Firestore call)
+                            _setupJeepneyTasksFromResult(routeResult,
+                                userLocation, destination.latLng, startPoint);
 
                             // 🧭 Start tracking user’s progress
                             _currentTaskIndex = 0;
@@ -3589,17 +4120,22 @@ class _MapScreenState extends State<MapScreen>
                               _polylines = polylines;
                             });
 
-                            final bounds = _boundsFromLatLngList(userToJeepney);
-                            if (bounds != null) {
-                              mapController?.animateCamera(
-                                CameraUpdate.newLatLngBounds(bounds, 50),
-                              );
+                            // Zoom to show ALL polylines
+                            final allPts =
+                                polylines.expand((p) => p.points).toList();
+                            if (allPts.isNotEmpty) {
+                              final bounds = _boundsFromLatLngList(allPts);
+                              if (bounds != null) {
+                                mapController?.animateCamera(
+                                  CameraUpdate.newLatLngBounds(bounds, 50),
+                                );
+                              }
                             }
 
                             break;
 
                           case "Habal":
-                            final userLocation = _userLocation;
+                            final userLocation = _effectiveStartLocation;
                             final destination = _selectedDestination;
 
                             if (userLocation == null || destination == null)
@@ -3657,7 +4193,7 @@ class _MapScreenState extends State<MapScreen>
                           case "Closest":
                             print("🚗 Closest/Direct route started");
 
-                            final userLocation = _userLocation;
+                            final userLocation = _effectiveStartLocation;
                             final destination = _selectedDestination;
 
                             if (userLocation == null || destination == null)

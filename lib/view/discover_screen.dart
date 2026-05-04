@@ -283,7 +283,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
                       _navButton(Icons.place, 'All Places'),
-                      _navButton(Icons.star_border, 'Favourites'),
+                      _navButton(Icons.favorite_rounded, 'Favourites'),
                     ],
                   ),
                   const SizedBox(height: 20),
@@ -299,28 +299,81 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
-                          'Categories',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 18,
-                          ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text(
+                              'Categories',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 18,
+                              ),
+                            ),
+                            if (_selectedCategory != null)
+                              GestureDetector(
+                                onTap: () {
+                                  setState(() {
+                                    _selectedCategory = null;
+                                    _filteredDestinations = _destinations;
+                                  });
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 10, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    color: Colors.grey[200],
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.close,
+                                          size: 14, color: Colors.grey),
+                                      SizedBox(width: 4),
+                                      Text('Clear',
+                                          style: TextStyle(
+                                              fontSize: 12,
+                                              color: Colors.grey,
+                                              fontWeight: FontWeight.w500)),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                          ],
                         ),
-                        const SizedBox(height: 16),
-                        SizedBox(
-                          height: 90,
-                          child: ListView(
-                            scrollDirection: Axis.horizontal,
-                            children: [
-                              _categoryItem('Natural Wonders',
-                                  'assets/natural-wonders.png'),
-                              _categoryItem('Cultural', 'assets/cultural.png'),
-                              _categoryItem(
-                                  'Recreational', 'assets/recreational.png'),
-                              _categoryItem(
-                                  'Entertainment', 'assets/entertainment.png'),
-                            ],
-                          ),
+                        const SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            _categoryItem(
+                                'Natural Wonders', 'assets/natural-wonders.png',
+                                displayLabel: 'Natural',
+                                gradient: const [
+                                  Color(0xFF43A047),
+                                  Color(0xFF66BB6A)
+                                ],
+                                icon: Icons.park_rounded),
+                            _categoryItem('Cultural', 'assets/cultural.png',
+                                gradient: const [
+                                  Color(0xFFE65100),
+                                  Color(0xFFFF8A65)
+                                ],
+                                icon: Icons.account_balance_rounded),
+                            _categoryItem(
+                                'Recreational', 'assets/recreational.png',
+                                gradient: const [
+                                  Color(0xFF1565C0),
+                                  Color(0xFF42A5F5)
+                                ],
+                                icon: Icons.sports_soccer_rounded),
+                            _categoryItem(
+                                'Entertainment', 'assets/entertainment.png',
+                                gradient: const [
+                                  Color(0xFF6A1B9A),
+                                  Color(0xFFAB47BC)
+                                ],
+                                icon: Icons.celebration_rounded),
+                          ],
                         ),
                         const SizedBox(height: 16),
                         const Text(
@@ -366,6 +419,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
 
                                   return filteredList.map((destination) {
                                     return DestinationCard(
+                                      key: ValueKey(destination.name),
                                       currentUser: _currentUser,
                                       name: destination.name,
                                       shortDescription:
@@ -407,7 +461,8 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
             curve: Curves.easeInOut,
             top: 0,
             bottom: 0,
-            left: _isDrawerOpen ? 0 : -MediaQuery.of(context).size.width * 0.75,
+            right:
+                _isDrawerOpen ? 0 : -MediaQuery.of(context).size.width * 0.75,
             child: CustomDrawer(
               currentUser: _currentUser,
               onClose: () {
@@ -420,11 +475,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                       builder: (context) => const SettingsScreen()),
                 );
               },
-              onLogout: () {
-                _authServices.signOut();
-                Navigator.pushReplacement(context,
-                    MaterialPageRoute(builder: (context) => LoginScreen()));
-              },
+              onLogout: _handleLogout,
               onItemTap: (String page) {
                 _toggleDrawer();
                 switch (page) {
@@ -490,17 +541,53 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
           );
         }
       },
-      child: Column(
-        children: [
-          Icon(icon, size: 32),
-          const SizedBox(height: 4),
-          Text(label, style: const TextStyle(fontWeight: FontWeight.w500)),
-        ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.08),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: label == 'Favourites'
+                    ? Colors.red.withOpacity(0.1)
+                    : Colors.blue.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(
+                icon,
+                size: 24,
+                color: label == 'Favourites' ? Colors.redAccent : Colors.blue,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Text(
+              label,
+              style: const TextStyle(
+                fontWeight: FontWeight.w600,
+                fontSize: 15,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _categoryItem(String label, String assetPath) {
+  Widget _categoryItem(String label, String assetPath,
+      {required List<Color> gradient,
+      required IconData icon,
+      String? displayLabel}) {
     final bool isSelected = _selectedCategory == label;
 
     return Padding(
@@ -508,40 +595,81 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       child: GestureDetector(
         onTap: () {
           setState(() {
-            // Toggle selection
             if (_selectedCategory == label) {
-              _selectedCategory = null; // unselect if tapped again
-              _filteredDestinations = _destinations; // show all again
-              print('Category cleared');
+              _selectedCategory = null;
+              _filteredDestinations = _destinations;
             } else {
               _selectedCategory = label;
               _filteredDestinations = _destinations
                   .where((destination) =>
                       destination.category.toLowerCase() == label.toLowerCase())
                   .toList();
-              print('Category selected: ${_selectedCategory!.toLowerCase()}');
             }
           });
         },
-        child: Column(
-          children: [
-            CircleAvatar(
-              radius: 30,
-              backgroundColor:
-                  isSelected ? Colors.blueAccent : Colors.blue[100],
-              child: Image.asset(assetPath, width: 50),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                color: isSelected ? Colors.blueAccent : Colors.black,
+        child: SizedBox(
+          width: 76,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOut,
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: isSelected
+                      ? LinearGradient(
+                          colors: gradient,
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        )
+                      : null,
+                  color: isSelected ? null : Colors.white,
+                  border: Border.all(
+                    color: isSelected ? gradient.first : Colors.grey[300]!,
+                    width: isSelected ? 2.5 : 1.5,
+                  ),
+                  boxShadow: [
+                    if (isSelected)
+                      BoxShadow(
+                        color: gradient.first.withOpacity(0.4),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      )
+                    else
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.06),
+                        blurRadius: 6,
+                        offset: const Offset(0, 2),
+                      ),
+                  ],
+                ),
+                child: Center(
+                  child: Image.asset(
+                    assetPath,
+                    width: 40,
+                    height: 40,
+                    color: isSelected ? Colors.white : null,
+                    colorBlendMode: isSelected ? BlendMode.srcIn : null,
+                  ),
+                ),
               ),
-              textAlign: TextAlign.center,
-            ),
-          ],
+              const SizedBox(height: 8),
+              Text(
+                displayLabel ?? label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                  color: isSelected ? gradient.first : Colors.grey[700],
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
         ),
       ),
     );
