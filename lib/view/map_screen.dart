@@ -1109,6 +1109,95 @@ class _MapScreenState extends State<MapScreen>
     return nearest!;
   }
 
+  // Helper to find nearest index in a route
+  int _findNearestIndex(List<LatLng> routePoints, LatLng target) {
+    double minDist = double.infinity;
+    int nearestIndex = 0;
+    for (int i = 0; i < routePoints.length; i++) {
+      final p = routePoints[i];
+      final d = Geolocator.distanceBetween(
+        p.latitude,
+        p.longitude,
+        target.latitude,
+        target.longitude,
+      );
+      if (d < minDist) {
+        minDist = d;
+        nearestIndex = i;
+      }
+    }
+    return nearestIndex;
+  }
+
+  // Returns the route segment between the nearest points to start/end.
+  List<LatLng> _sliceRouteSegmentPoints(
+      List<LatLng> routePoints, LatLng start, LatLng end) {
+    if (routePoints.isEmpty) return [];
+    final startIdx = _findNearestIndex(routePoints, start);
+    final endIdx = _findNearestIndex(routePoints, end);
+    if (startIdx <= endIdx) {
+      return routePoints.sublist(startIdx, endIdx + 1);
+    }
+    return routePoints.sublist(endIdx, startIdx + 1).reversed.toList();
+  }
+
+  // Backwards-compatible name used by existing call sites.
+  List<LatLng> _sliceRouteSegment(
+      List<LatLng> routePoints, LatLng start, LatLng end) {
+    return _sliceRouteSegmentPoints(routePoints, start, end);
+  }
+
+  // Build a road-snapped polyline by chaining Google Directions per segment.
+  Future<List<LatLng>> _buildRoadPolylineFromPoints(
+      List<LatLng> routePoints) async {
+    if (routePoints.length < 2) return routePoints;
+    final snapped = <LatLng>[];
+    for (int i = 0; i < routePoints.length - 1; i++) {
+      final segment = await _fetchPolyline(routePoints[i], routePoints[i + 1]);
+      if (segment.isEmpty) continue;
+      if (snapped.isNotEmpty) {
+        // Drop the first point to avoid duplicates between segments.
+        snapped.addAll(segment.sublist(1));
+      } else {
+        snapped.addAll(segment);
+      }
+    }
+    return snapped;
+  }
+
+  // Uses Google Directions between sampled points to keep the path on roads.
+  Future<List<LatLng>> _buildRoadPolylineFromRouteSegment(
+    List<LatLng> routePoints,
+    LatLng start,
+    LatLng end, {
+    int stride = 5,
+  }) async {
+    final segment = _sliceRouteSegmentPoints(routePoints, start, end);
+    if (segment.length < 2) return segment;
+
+    final sampled = <LatLng>[];
+    for (int i = 0; i < segment.length; i += stride) {
+      sampled.add(segment[i]);
+    }
+    if (sampled.last != segment.last) {
+      sampled.add(segment.last);
+    }
+
+    final roadPoints = <LatLng>[];
+    for (int i = 0; i < sampled.length - 1; i++) {
+      final chunk = await _fetchPolyline(sampled[i], sampled[i + 1]);
+      if (chunk.isNotEmpty) {
+        if (roadPoints.isNotEmpty && roadPoints.last == chunk.first) {
+          roadPoints.addAll(chunk.sublist(1));
+        } else {
+          roadPoints.addAll(chunk);
+        }
+      }
+    }
+
+    return roadPoints.isNotEmpty ? roadPoints : segment;
+  }
+
   // ========== FARE CALCULATION METHODS ==========
 
   double calculateJeepneyFare(double distanceKm) {
@@ -1219,7 +1308,16 @@ class _MapScreenState extends State<MapScreen>
     }
 
     // Maximum acceptable walking distance from a route stop (in km)
-    const maxWalkToRoute = 1.5;
+    const maxWalkToRoute = 1.3;
+
+    // Penalize long walking segments to prefer transfers when walking is large.
+    // const double walkPenaltyThresholdKm = 0.5;
+    // const double walkPenaltyPerKm = 1.2;
+    const walkPenaltyThreshold200m = 0.2;
+    double _walkingPenalty(double walk200m) {
+      if (walk200m <= walkPenaltyThreshold200m) return 0.0;
+      return (walk200m - walkPenaltyThreshold200m) * 3;
+    }
 
     // ─── 1️⃣ Try to find a single route that serves both points ───
     // A single route is valid ONLY if:
@@ -1279,10 +1377,15 @@ class _MapScreenState extends State<MapScreen>
       final fare = calculateJeepneyFare(rideDistKm);
       // Score: total walk distance + ride distance, weighted with fare
       final totalDist = userInfo.distKm + destInfo.distKm + rideDistKm;
-      final score = calculateRouteScore(totalDist, fare, mode: "jeepney");
+      final walkingKm = userInfo.distKm + destInfo.distKm;
+      final walkingPenalty = _walkingPenalty(walkingKm);
+      final score = calculateRouteScore(totalDist, fare, mode: "jeepney") +
+          walkingPenalty;
 
       print("   🚌 Ride: ${rideDistKm.toStringAsFixed(2)}km");
       print("   💰 Fare: ₱${fare.toStringAsFixed(0)}");
+      print(
+          "   🚶 Walk: ${walkingKm.toStringAsFixed(2)}km | Penalty: ${walkingPenalty.toStringAsFixed(2)}");
       print("   📊 Score: ${score.toStringAsFixed(2)}");
 
       if (score < bestSingleRouteScore) {
@@ -1292,17 +1395,8 @@ class _MapScreenState extends State<MapScreen>
       }
     }
 
-    if (bestSingleRoute != null) {
-      print("✅ Single jeepney ride: ${bestSingleRoute.name}");
-      return {
-        "type": "single",
-        "routes": [bestSingleRoute],
-        "transferPoint": null,
-      };
-    }
-
-    // ─── 2️⃣ No single route works — find best double-ride combination ───
-    print("⚠️ No single route found, calculating double ride...");
+    // ─── 2️⃣ Find best double-ride combination (even if a single exists) ───
+    print("🔄 Evaluating double-ride options...");
 
     // For each pair (routeA for origin, routeB for destination) find the pair
     // whose transfer point is closest. Also enforce directionality on each leg.
@@ -1310,25 +1404,79 @@ class _MapScreenState extends State<MapScreen>
     JeepneyRoute? bestRouteA;
     JeepneyRoute? bestRouteB;
     LatLng? bestTransfer;
+    LatLng? bestTransferA;
+    LatLng? bestTransferB;
 
     for (final routeA in jeepneyRoutes) {
       final userInfoA = _nearestPointInfo(routeA, userLocation);
-      if (userInfoA.distKm > maxWalkToRoute * 2) continue; // generous limit
+      if (userInfoA.distKm > maxWalkToRoute * 2) continue;
 
       for (final routeB in jeepneyRoutes) {
-        if (routeB.id == routeA.id) continue; // skip same route
+        if (routeB.id == routeA.id) continue;
 
         final destInfoB = _nearestPointInfo(routeB, destination);
         if (destInfoB.distKm > maxWalkToRoute * 2) continue;
 
-        // Find closest connection between routeA and routeB
+        // ── Direction detection ──────────────────────────────────────────────
+        // Route A: compare which end of the route is closer to the destination
+        // area. If the last point is closer, the route travels forward (toward
+        // dest), so the user's transfer index must be > their boarding index.
+        // If the first point is closer, the route runs in the opposite direction
+        // relative to the stored order, so transfer index < boarding index.
+        final routeAFirstToDest = Geolocator.distanceBetween(
+          routeA.points.first.latitude,
+          routeA.points.first.longitude,
+          destination.latitude,
+          destination.longitude,
+        );
+        final routeALastToDest = Geolocator.distanceBetween(
+          routeA.points.last.latitude,
+          routeA.points.last.longitude,
+          destination.latitude,
+          destination.longitude,
+        );
+        // forward = stored order moves TOWARD the destination
+        final routeAForward = routeALastToDest < routeAFirstToDest;
+
+        // Route B: compare which end is closer to the user's origin.
+        // forward = stored order starts near user side, ends near dest side.
+        final routeBFirstToUser = Geolocator.distanceBetween(
+          routeB.points.first.latitude,
+          routeB.points.first.longitude,
+          userLocation.latitude,
+          userLocation.longitude,
+        );
+        final routeBLastToUser = Geolocator.distanceBetween(
+          routeB.points.last.latitude,
+          routeB.points.last.longitude,
+          userLocation.latitude,
+          userLocation.longitude,
+        );
+        // forward = stored order starts near the user side (boarding near start)
+        final routeBForward = routeBFirstToUser < routeBLastToUser;
+
+        // Valid transfer index on Route A: must be "ahead" of user in direction
+        // of travel.  forward → iA > userInfoA.index
+        //              reverse → iA < userInfoA.index
+        bool isValidA(int iA) =>
+            routeAForward ? iA > userInfoA.index : iA < userInfoA.index;
+
+        // Valid transfer index on Route B: must be "before" destination in
+        // direction of travel.  forward → iB < destInfoB.index
+        //                        reverse → iB > destInfoB.index
+        bool isValidB(int iB) =>
+            routeBForward ? iB < destInfoB.index : iB > destInfoB.index;
+
+        // ── Find closest connection respecting detected directions ────────────
         double bestConn = double.infinity;
         int bestIdxA = -1;
         int bestIdxB = -1;
         LatLng? connPoint;
 
         for (int iA = 0; iA < routeA.points.length; iA++) {
+          if (!isValidA(iA)) continue;
           for (int iB = 0; iB < routeB.points.length; iB++) {
+            if (!isValidB(iB)) continue;
             final pA = routeA.points[iA];
             final pB = routeB.points[iB];
             final d = Geolocator.distanceBetween(
@@ -1349,18 +1497,79 @@ class _MapScreenState extends State<MapScreen>
           }
         }
 
-        if (connPoint == null) continue;
-
-        // Directionality: user must be before transfer on routeA,
-        // transfer must be before destination on routeB
-        if (userInfoA.index >= bestIdxA || bestIdxB >= destInfoB.index) {
-          continue; // wrong direction on one of the legs
+        // Fallback: no direction-constrained pair found → try all combinations
+        if (connPoint == null) {
+          for (int iA = 0; iA < routeA.points.length; iA++) {
+            for (int iB = 0; iB < routeB.points.length; iB++) {
+              final pA = routeA.points[iA];
+              final pB = routeB.points[iB];
+              final d = Geolocator.distanceBetween(
+                pA.latitude,
+                pA.longitude,
+                pB.latitude,
+                pB.longitude,
+              );
+              if (d < bestConn) {
+                bestConn = d;
+                bestIdxA = iA;
+                bestIdxB = iB;
+                connPoint = LatLng(
+                  (pA.latitude + pB.latitude) / 2,
+                  (pA.longitude + pB.longitude) / 2,
+                );
+              }
+            }
+          }
         }
 
-        // Calculate total distance & score
+        if (connPoint == null) continue;
+
+        final initialIdxA = bestIdxA;
+        final initialIdxB = bestIdxB;
+        final initialRouteAPoint = routeA.points[initialIdxA];
+        final initialRouteBPoint = routeB.points[initialIdxB];
+
+        // Refine: given the best Route A exit point, find the closest Route B
+        // boarding point that respects Route B's direction.
+        final routeAPointCandidate = routeA.points[bestIdxA];
+        double bestBToA = double.infinity;
+        int refinedIdxB = -1;
+        for (int iB = 0; iB < routeB.points.length; iB++) {
+          if (!isValidB(iB)) continue;
+          final pB = routeB.points[iB];
+          final d = Geolocator.distanceBetween(
+            routeAPointCandidate.latitude,
+            routeAPointCandidate.longitude,
+            pB.latitude,
+            pB.longitude,
+          );
+          if (d < bestBToA) {
+            bestBToA = d;
+            refinedIdxB = iB;
+          }
+        }
+
+        if (refinedIdxB == -1) continue;
+
+        bestIdxB = refinedIdxB;
+        bestConn = bestBToA;
+        final refinedBPoint = routeB.points[bestIdxB];
+        connPoint = LatLng(
+          (routeAPointCandidate.latitude + refinedBPoint.latitude) / 2,
+          (routeAPointCandidate.longitude + refinedBPoint.longitude) / 2,
+        );
+
+        // Final direction validity check with direction-aware comparisons
+        if (!isValidA(bestIdxA) || !isValidB(bestIdxB)) continue;
+
+        // ── Leg distance accumulation (direction-aware) ──────────────────────
         final walkToA = userInfoA.distKm;
+
+        // Accumulate Route A leg (user boarding → transfer exit)
         double legADist = 0;
-        for (int i = userInfoA.index; i < bestIdxA; i++) {
+        final aStart = routeAForward ? userInfoA.index : bestIdxA;
+        final aEnd = routeAForward ? bestIdxA : userInfoA.index;
+        for (int i = aStart; i < aEnd; i++) {
           final p1 = routeA.points[i];
           final p2 = routeA.points[i + 1];
           legADist += Geolocator.distanceBetween(
@@ -1371,9 +1580,14 @@ class _MapScreenState extends State<MapScreen>
               ) /
               1000;
         }
+
         final transferWalk = bestConn / 1000;
+
+        // Accumulate Route B leg (transfer boarding → destination)
         double legBDist = 0;
-        for (int i = bestIdxB; i < destInfoB.index; i++) {
+        final bStart = routeBForward ? bestIdxB : destInfoB.index;
+        final bEnd = routeBForward ? destInfoB.index : bestIdxB;
+        for (int i = bStart; i < bEnd; i++) {
           final p1 = routeB.points[i];
           final p2 = routeB.points[i + 1];
           legBDist += Geolocator.distanceBetween(
@@ -1384,20 +1598,47 @@ class _MapScreenState extends State<MapScreen>
               ) /
               1000;
         }
+
         final walkFromB = destInfoB.distKm;
 
         final totalDist =
             walkToA + legADist + transferWalk + legBDist + walkFromB;
         final totalFare =
             calculateJeepneyFare(legADist) + calculateJeepneyFare(legBDist);
+        final walkingKm = walkToA + transferWalk + walkFromB;
+        final walkingPenaltyKm = walkToA + walkFromB;
+        final walking200m = walkingPenaltyKm * 5;
         final score =
-            calculateRouteScore(totalDist, totalFare, mode: "jeepney");
+            calculateRouteScore(totalDist, totalFare, mode: "jeepney") +
+                _walkingPenalty(walking200m);
+
+        final routeAPoint = LatLng(routeA.points[bestIdxA].latitude,
+            routeA.points[bestIdxA].longitude);
+        final routeBPoint = LatLng(routeB.points[bestIdxB].latitude,
+            routeB.points[bestIdxB].longitude);
+
+        print("   🔁 Double option: ${routeA.name} → ${routeB.name} | "
+            "dirA=${routeAForward ? 'fwd' : 'rev'} dirB=${routeBForward ? 'fwd' : 'rev'} | "
+            "walk=${walkingKm.toStringAsFixed(2)}km | "
+            "ride=${(legADist + legBDist).toStringAsFixed(2)}km | "
+            "fare=₱${totalFare.toStringAsFixed(0)} | "
+            "score=${score.toStringAsFixed(2)}");
+        print(
+            "      📍 Initial A: ${initialRouteAPoint.latitude}, ${initialRouteAPoint.longitude} (idx $initialIdxA)");
+        print(
+            "      📍 Initial B: ${initialRouteBPoint.latitude}, ${initialRouteBPoint.longitude} (idx $initialIdxB)");
+        print(
+            "      📍 Refined A: ${routeAPoint.latitude}, ${routeAPoint.longitude} (idx $bestIdxA)");
+        print(
+            "      📍 Refined B: ${routeBPoint.latitude}, ${routeBPoint.longitude} (idx $bestIdxB)");
 
         if (score < bestDoubleScore) {
           bestDoubleScore = score;
           bestRouteA = routeA;
           bestRouteB = routeB;
           bestTransfer = connPoint;
+          bestTransferA = routeAPoint;
+          bestTransferB = routeBPoint;
         }
       }
     }
@@ -1430,19 +1671,42 @@ class _MapScreenState extends State<MapScreen>
           );
           if (d < shortestConnection) {
             shortestConnection = d;
-            bestTransfer = LatLng(p1.latitude, p1.longitude);
+            bestTransferA = LatLng(p1.latitude, p1.longitude);
+            bestTransferB = LatLng(p2.latitude, p2.longitude);
+            bestTransfer = LatLng(
+              (p1.latitude + p2.latitude) / 2,
+              (p1.longitude + p2.longitude) / 2,
+            );
           }
         }
       }
     }
 
-    print("🔄 Double ride: ${bestRouteA!.name} → ${bestRouteB!.name}");
+    if (bestSingleRoute != null && bestSingleRouteScore <= bestDoubleScore) {
+      print("✅ Single jeepney ride: ${bestSingleRoute.name}");
+      return {
+        "type": "single",
+        "routes": [bestSingleRoute],
+        "transferPoint": null,
+      };
+    }
 
-    return {
-      "type": "double",
-      "routes": [bestRouteA, bestRouteB],
-      "transferPoint": bestTransfer,
-    };
+    if (bestRouteA != null &&
+        bestRouteB != null &&
+        bestTransfer != null &&
+        bestTransferA != null &&
+        bestTransferB != null) {
+      print("🔄 Double ride: ${bestRouteA!.name} → ${bestRouteB!.name}");
+      return {
+        "type": "double",
+        "routes": [bestRouteA, bestRouteB],
+        "transferPoint": bestTransfer,
+        "transferPointA": bestTransferA,
+        "transferPointB": bestTransferB,
+      };
+    }
+
+    throw Exception("No jeepney route found.");
   }
 
   Future<void> _setupMultimodalRoute(
@@ -2134,20 +2398,21 @@ class _MapScreenState extends State<MapScreen>
       totalJeepneyFare = calculateJeepneyFare(jeepneyRideDistance);
     } else {
       // Double jeepney
-      final transferPoint = jeepneyResult["transferPoint"] as LatLng;
+      final transferPointA = jeepneyResult["transferPointA"] as LatLng;
+      final transferPointB = jeepneyResult["transferPointB"] as LatLng;
       final secondRoute = routes[1];
 
       final firstLegDistance = calculateDistance(
         jeepneyPickup.latitude,
         jeepneyPickup.longitude,
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointA.latitude,
+        transferPointA.longitude,
       );
       final firstLegFare = calculateJeepneyFare(firstLegDistance);
 
       final secondRouteStart = _findNearestPoint(
         secondRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
-        transferPoint,
+        transferPointB,
       );
       final nearestToDest = _findNearestPoint(
         secondRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
@@ -2225,7 +2490,13 @@ class _MapScreenState extends State<MapScreen>
       );
       final jeepneyFare = calculateJeepneyFare(jeepneyRideDistance);
 
-      final jeepneyRoute = await _fetchPolyline(jeepneyPickup, nearestToDest);
+      final jeepneyRoute = await _buildRoadPolylineFromPoints(
+        _sliceRouteSegment(
+          firstRoute.latLngPoints,
+          jeepneyPickup,
+          nearestToDest,
+        ),
+      );
       polylines.add(
         Polyline(
           polylineId: const PolylineId("jeepney_route"),
@@ -2275,19 +2546,26 @@ class _MapScreenState extends State<MapScreen>
       }
     } else {
       // Double jeepney
-      final transferPoint = jeepneyResult["transferPoint"] as LatLng;
+      final transferPointA = jeepneyResult["transferPointA"] as LatLng;
+      final transferPointB = jeepneyResult["transferPointB"] as LatLng;
       final secondRoute = routes[1];
 
       // Calculate first jeepney leg distance
       final firstLegDistance = calculateDistance(
         jeepneyPickup.latitude,
         jeepneyPickup.longitude,
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointA.latitude,
+        transferPointA.longitude,
       );
       final firstLegFare = calculateJeepneyFare(firstLegDistance);
 
-      final firstLeg = await _fetchPolyline(jeepneyPickup, transferPoint);
+      final firstLeg = await _buildRoadPolylineFromPoints(
+        _sliceRouteSegment(
+          firstRoute.latLngPoints,
+          jeepneyPickup,
+          transferPointA,
+        ),
+      );
       polylines.add(
         Polyline(
           polylineId: const PolylineId("jeepney_first_leg"),
@@ -2297,13 +2575,30 @@ class _MapScreenState extends State<MapScreen>
         ),
       );
 
+      final transferWalk = await _fetchPolyline(
+        transferPointA,
+        transferPointB,
+        mode: "walking",
+      );
+      if (transferWalk.isNotEmpty) {
+        polylines.add(
+          Polyline(
+            polylineId: const PolylineId("transfer_walk"),
+            color: Colors.orange,
+            width: 6,
+            points: transferWalk,
+            patterns: [PatternItem.dash(20), PatternItem.gap(10)],
+          ),
+        );
+      }
+
       _tasks.add({
         "title": "Ride ${firstRoute.name}",
         "shortDescription":
             "Take ${firstRoute.name} to the transfer point (₱${firstLegFare.toStringAsFixed(0)}).",
         "longDescription":
             "Ride ${firstRoute.name} until the transfer point. Fare: ₱${firstLegFare.toStringAsFixed(0)} for ${firstLegDistance.toStringAsFixed(1)}km.",
-        "target": transferPoint,
+        "target": transferPointA,
         "radius": 30.0,
       });
 
@@ -2311,7 +2606,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Transfer Jeepney",
         "shortDescription": "Switch to ${secondRoute.name}.",
         "longDescription": "Wait for and board ${secondRoute.name}.",
-        "target": transferPoint,
+        "target": transferPointB,
         "radius": 25.0,
       });
 
@@ -2322,14 +2617,20 @@ class _MapScreenState extends State<MapScreen>
 
       // Calculate second jeepney leg distance
       final secondLegDistance = calculateDistance(
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointB.latitude,
+        transferPointB.longitude,
         nearestToDest.latitude,
         nearestToDest.longitude,
       );
       final secondLegFare = calculateJeepneyFare(secondLegDistance);
 
-      final secondLeg = await _fetchPolyline(transferPoint, nearestToDest);
+      final secondLeg = await _buildRoadPolylineFromPoints(
+        _sliceRouteSegment(
+          secondRoute.latLngPoints,
+          transferPointB,
+          nearestToDest,
+        ),
+      );
       polylines.add(
         Polyline(
           polylineId: const PolylineId("jeepney_second_leg"),
@@ -2505,20 +2806,21 @@ class _MapScreenState extends State<MapScreen>
       fareDescription = "${jeepneyRideDistance.toStringAsFixed(1)}km";
     } else {
       // Double jeepney - calculate both legs
-      final transferPoint = routeResult["transferPoint"] as LatLng;
+      final transferPointA = routeResult["transferPointA"] as LatLng;
+      final transferPointB = routeResult["transferPointB"] as LatLng;
       final secondRoute = routeResult["routes"][1] as JeepneyRoute;
 
       final firstLegDistance = calculateDistance(
         startPoint.latitude,
         startPoint.longitude,
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointA.latitude,
+        transferPointA.longitude,
       );
       final firstLegFare = calculateJeepneyFare(firstLegDistance);
 
       final secondRouteStart = _findNearestPoint(
         secondRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
-        transferPoint,
+        transferPointB,
       );
       final nearestToDest = _findNearestPoint(
         secondRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
@@ -2561,7 +2863,13 @@ class _MapScreenState extends State<MapScreen>
       );
       final jeepneyFare = calculateJeepneyFare(jeepneyRideDistance);
 
-      final jeepneyToNearest = await _fetchPolyline(startPoint, nearestToDest);
+      final jeepneyToNearest = await _buildRoadPolylineFromPoints(
+        _sliceRouteSegment(
+          firstRoute.latLngPoints,
+          startPoint,
+          nearestToDest,
+        ),
+      );
       polylines.add(
         Polyline(
           polylineId: const PolylineId("jeepney_route"),
@@ -2611,19 +2919,26 @@ class _MapScreenState extends State<MapScreen>
       }
     } else {
       // Double jeepney
-      final transferPoint = routeResult["transferPoint"] as LatLng;
+      final transferPointA = routeResult["transferPointA"] as LatLng;
+      final transferPointB = routeResult["transferPointB"] as LatLng;
       final secondRoute = routeResult["routes"][1] as JeepneyRoute;
 
-      // Calculate first jeepney leg distance
+      // Calculate first jeepney leg distance (user pickup → Route A exit point)
       final firstLegDistance = calculateDistance(
         startPoint.latitude,
         startPoint.longitude,
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointA.latitude,
+        transferPointA.longitude,
       );
       final firstLegFare = calculateJeepneyFare(firstLegDistance);
 
-      final firstLeg = await _fetchPolyline(startPoint, transferPoint);
+      final firstLeg = await _buildRoadPolylineFromPoints(
+        _sliceRouteSegment(
+          firstRoute.latLngPoints,
+          startPoint,
+          transferPointA, // ✅ actual point on Route A
+        ),
+      );
       polylines.add(
         Polyline(
           polylineId: const PolylineId("jeepney_first_leg"),
@@ -2633,13 +2948,31 @@ class _MapScreenState extends State<MapScreen>
         ),
       );
 
+      // ✅ Transfer walk polyline connecting Route A exit → Route B entry
+      final transferWalk = await _fetchPolyline(
+        transferPointA,
+        transferPointB,
+        mode: "walking",
+      );
+      if (transferWalk.isNotEmpty) {
+        polylines.add(
+          Polyline(
+            polylineId: const PolylineId("transfer_walk"),
+            color: Colors.orange,
+            width: 6,
+            points: transferWalk,
+            patterns: [PatternItem.dash(20), PatternItem.gap(10)],
+          ),
+        );
+      }
+
       _tasks.add({
         "title": "Ride ${firstRoute.name}",
         "shortDescription":
             "Ride ${firstRoute.name} to the transfer point (₱${firstLegFare.toStringAsFixed(0)}).",
         "longDescription":
             "Take ${firstRoute.name} until the transfer point for your next jeepney. Fare: ₱${firstLegFare.toStringAsFixed(0)} for ${firstLegDistance.toStringAsFixed(1)}km.",
-        "target": transferPoint,
+        "target": transferPointA, // ✅ actual exit point on Route A
         "radius": 30.0,
       });
 
@@ -2648,7 +2981,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription": "Transfer to ${secondRoute.name}.",
         "longDescription":
             "Switch to ${secondRoute.name} to continue your journey.",
-        "target": transferPoint,
+        "target": transferPointB, // ✅ actual entry point on Route B
         "radius": 25.0,
       });
 
@@ -2657,16 +2990,22 @@ class _MapScreenState extends State<MapScreen>
         destination,
       );
 
-      // Calculate second jeepney leg distance
+      // Calculate second jeepney leg distance (Route B entry → nearest to dest)
       final secondLegDistance = calculateDistance(
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointB.latitude,
+        transferPointB.longitude,
         nearestToDest.latitude,
         nearestToDest.longitude,
       );
       final secondLegFare = calculateJeepneyFare(secondLegDistance);
 
-      final secondLeg = await _fetchPolyline(transferPoint, nearestToDest);
+      final secondLeg = await _buildRoadPolylineFromPoints(
+        _sliceRouteSegment(
+          secondRoute.latLngPoints,
+          transferPointB, // ✅ actual entry point on Route B
+          nearestToDest,
+        ),
+      );
       polylines.add(
         Polyline(
           polylineId: const PolylineId("jeepney_second_leg"),
@@ -2799,7 +3138,8 @@ class _MapScreenState extends State<MapScreen>
 
       final firstRoute = routes[0];
       final secondRoute = routes[1];
-      final transferPoint = routeResult["transferPoint"] as LatLng;
+      final transferPointA = routeResult["transferPointA"] as LatLng;
+      final transferPointB = routeResult["transferPointB"] as LatLng;
       final startPoint = LatLng(
           firstRoute.points.first.latitude, firstRoute.points.first.longitude);
 
@@ -2811,12 +3151,12 @@ class _MapScreenState extends State<MapScreen>
       final firstRouteDistance = calculateDistance(
           startPoint.latitude,
           startPoint.longitude,
-          transferPoint.latitude,
-          transferPoint.longitude);
+          transferPointA.latitude,
+          transferPointA.longitude);
 
       final secondRouteDistance = calculateDistance(
-          secondRoute.points.first.latitude,
-          secondRoute.points.first.longitude,
+          transferPointB.latitude,
+          transferPointB.longitude,
           nearestToDest.latitude,
           nearestToDest.longitude);
 
@@ -2838,7 +3178,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription": "Ride ${firstRoute.name} to the transfer point.",
         "longDescription":
             "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\n Fare: ₱${firstJeepneyFare.toStringAsFixed(0)}\n Distance: ${firstRouteDistance.toStringAsFixed(1)}km.",
-        "target": transferPoint,
+        "target": transferPointA,
       });
 
       _tasks.add({
@@ -2846,7 +3186,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription": "Transfer to ${secondRoute.name}.",
         "longDescription":
             "Switch to ${secondRoute.name} to continue your journey.\n\n Upcoming Fare: ₱${secondJeepneyFare.toStringAsFixed(0)}",
-        "target": transferPoint,
+        "target": transferPointB,
       });
 
       _tasks.add({
@@ -2940,7 +3280,8 @@ class _MapScreenState extends State<MapScreen>
     } else {
       final firstRoute = routes[0];
       final secondRoute = routes[1];
-      final transferPoint = routeResult["transferPoint"] as LatLng;
+      final transferPointA = routeResult["transferPointA"] as LatLng;
+      final transferPointB = routeResult["transferPointB"] as LatLng;
 
       final nearestToDest = _findNearestPoint(
         secondRoute.points.map((p) => LatLng(p.latitude, p.longitude)).toList(),
@@ -2950,12 +3291,12 @@ class _MapScreenState extends State<MapScreen>
       final firstRouteDistance = calculateDistance(
         startPoint.latitude,
         startPoint.longitude,
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointA.latitude,
+        transferPointA.longitude,
       );
       final secondRouteDistance = calculateDistance(
-        transferPoint.latitude,
-        transferPoint.longitude,
+        transferPointB.latitude,
+        transferPointB.longitude,
         nearestToDest.latitude,
         nearestToDest.longitude,
       );
@@ -2977,7 +3318,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription": "Ride ${firstRoute.name} to the transfer point.",
         "longDescription":
             "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\nFare: ₱${firstJeepneyFare.toStringAsFixed(0)}\nDistance: ${firstRouteDistance.toStringAsFixed(1)}km.",
-        "target": transferPoint,
+        "target": transferPointA,
       });
 
       _tasks.add({
@@ -2985,7 +3326,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription": "Transfer to ${secondRoute.name}.",
         "longDescription":
             "Switch to ${secondRoute.name} to continue your journey.\n\nUpcoming Fare: ₱${secondJeepneyFare.toStringAsFixed(0)}",
-        "target": transferPoint,
+        "target": transferPointB,
       });
 
       _tasks.add({
@@ -3998,8 +4339,14 @@ class _MapScreenState extends State<MapScreen>
                               );
 
                               // 🚍 Draw the jeepney route up to that point
-                              final jeepneyToNearest = await _fetchPolyline(
-                                  startPoint, nearestToDest);
+                              final jeepneyToNearest =
+                                  await _buildRoadPolylineFromPoints(
+                                _sliceRouteSegment(
+                                  firstRoute.latLngPoints,
+                                  startPoint,
+                                  nearestToDest,
+                                ),
+                              );
                               polylines.add(
                                 Polyline(
                                   polylineId: const PolylineId("jeepney_route"),
@@ -4041,15 +4388,44 @@ class _MapScreenState extends State<MapScreen>
                               }
                             } else {
                               // 🚎 Double ride
-                              final transferPoint =
-                                  routeResult["transferPoint"] as LatLng;
+                              final transferPointA =
+                                  routeResult["transferPointA"] as LatLng;
+                              final transferPointB =
+                                  routeResult["transferPointB"] as LatLng;
                               final secondRoute =
                                   routeResult["routes"][1] as JeepneyRoute;
 
-                              final firstLeg = await _fetchPolyline(
-                                  startPoint, transferPoint);
-                              final secondLeg = await _fetchPolyline(
-                                  transferPoint, destination.latLng);
+                              // ✅ Nearest point from second route to destination
+                              final nearestToDest = _findNearestPoint(
+                                secondRoute.points
+                                    .map((p) => LatLng(p.latitude, p.longitude))
+                                    .toList(),
+                                destination.latLng,
+                              );
+
+                              final firstLeg =
+                                  await _buildRoadPolylineFromPoints(
+                                _sliceRouteSegment(
+                                  firstRoute.latLngPoints,
+                                  startPoint,
+                                  transferPointA,
+                                ),
+                              );
+
+                              final transferWalk = await _fetchPolyline(
+                                transferPointA,
+                                transferPointB,
+                                mode: "walking",
+                              );
+
+                              final secondLeg =
+                                  await _buildRoadPolylineFromPoints(
+                                _sliceRouteSegment(
+                                  secondRoute.latLngPoints,
+                                  transferPointB,
+                                  nearestToDest,
+                                ),
+                              );
 
                               polylines.addAll([
                                 Polyline(
@@ -4059,6 +4435,18 @@ class _MapScreenState extends State<MapScreen>
                                   width: 6,
                                   points: firstLeg,
                                 ),
+                                if (transferWalk.isNotEmpty)
+                                  Polyline(
+                                    polylineId:
+                                        const PolylineId("transfer_walk"),
+                                    color: Colors.orange,
+                                    width: 6,
+                                    points: transferWalk,
+                                    patterns: [
+                                      PatternItem.dash(20),
+                                      PatternItem.gap(10)
+                                    ],
+                                  ),
                                 Polyline(
                                   polylineId:
                                       const PolylineId("jeepney_second_leg"),
@@ -4067,14 +4455,6 @@ class _MapScreenState extends State<MapScreen>
                                   points: secondLeg,
                                 ),
                               ]);
-
-                              // ✅ Nearest point from second route to destination
-                              final nearestToDest = _findNearestPoint(
-                                secondRoute.points
-                                    .map((p) => LatLng(p.latitude, p.longitude))
-                                    .toList(),
-                                destination.latLng,
-                              );
 
                               final endDist = Geolocator.distanceBetween(
                                 nearestToDest.latitude,

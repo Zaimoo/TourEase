@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:tourease/services/use_auth.dart';
+import 'package:tourease/view/jeepney_routes_screen.dart';
 import 'package:tourease/view/login_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -122,6 +123,15 @@ class SettingsScreen extends StatelessWidget {
           _buildSettingItem(Icons.language, "Language"),
           _buildSettingItem(Icons.help_outline, "Help & Support"),
           const Divider(),
+          _buildSettingItem(
+            Icons.bug_report,
+            "DEBUG: ROUTE VIEWER",
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const JeepneyRoutesScreen()),
+              );
+            },
+          ),
           _buildSettingItem(Icons.info_outline, "About App"),
           const SizedBox(height: 8),
           Card(
@@ -160,7 +170,7 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildSettingItem(IconData icon, String title) {
+  Widget _buildSettingItem(IconData icon, String title, {VoidCallback? onTap}) {
     return Card(
       elevation: 2,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -169,7 +179,7 @@ class SettingsScreen extends StatelessWidget {
         leading: Icon(icon, color: Colors.blueAccent),
         title: Text(title),
         trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-        onTap: () {},
+        onTap: onTap ?? () {},
       ),
     );
   }
