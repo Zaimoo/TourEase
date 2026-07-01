@@ -6,19 +6,20 @@ class TransportationMarkers {
   final String vehicleType;
   final GeoPoint coordinates;
 
-  TransportationMarkers({ required this.id, required this.vehicleType, required this.coordinates});
+  TransportationMarkers(
+      {required this.id, required this.vehicleType, required this.coordinates});
 
   LatLng get latLng => LatLng(coordinates.latitude, coordinates.longitude);
 
-  factory TransportationMarkers.fromJson(Map<String,dynamic> data, String id) {
+  factory TransportationMarkers.fromJson(Map<String, dynamic> data, String id) {
     return TransportationMarkers(
       id: id,
-      vehicleType: data['vehicleType'],
+      vehicleType: (data['vehicleType'] as String?) ?? 'unknown',
       coordinates: data['coordinates'],
     );
   }
 
-  Map<String,dynamic> toJson() {
+  Map<String, dynamic> toJson() {
     return {
       'vehicleType': vehicleType,
       'coordinates': coordinates,

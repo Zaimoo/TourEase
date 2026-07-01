@@ -6,6 +6,11 @@ class AppUser {
   final String phone;
   final String profileUrl;
 
+  /// Admins can verify pending reviews and access admin-only screens. Promoted
+  /// manually by setting `isAdmin: true` on the user's Firestore doc (no in-app
+  /// promotion UI). Defaults to false for everyone else.
+  final bool isAdmin;
+
   AppUser({
     required this.id,
     required this.name,
@@ -13,6 +18,7 @@ class AppUser {
     required this.password,
     required this.phone,
     required this.profileUrl,
+    this.isAdmin = false,
   });
 
   factory AppUser.fromJson(Map<String, dynamic> data, String id) {
@@ -23,6 +29,7 @@ class AppUser {
       password: data['password'] as String? ?? "",
       phone: data['phone'] as String? ?? "",
       profileUrl: data['profileUrl'] as String? ?? "",
+      isAdmin: data['isAdmin'] as bool? ?? false,
     );
   }
 
@@ -33,6 +40,7 @@ class AppUser {
       'password': password,
       'phone': phone,
       'profileUrl': profileUrl,
+      'isAdmin': isAdmin,
     };
   }
 }

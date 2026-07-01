@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:tourease/services/use_auth.dart';
@@ -55,6 +56,8 @@ class _DestinationCardState extends State<DestinationCard> {
   double? _distanceKm;
   bool _isLoading = true;
   bool _isFavorited = false;
+  double _liveRating = 0;
+  int _reviewCount = 0;
 
   final favoritesService = UseFirebase<Favorite>(
     fromJson: (data, id) => Favorite.fromJson(data, id),
@@ -64,6 +67,7 @@ class _DestinationCardState extends State<DestinationCard> {
   @override
   void initState() {
     super.initState();
+    _fetchAverageRating();
     // Use cached distance if available, otherwise fetch
     if (widget.cachedDistance != null) {
       _distanceKm = widget.cachedDistance;
@@ -87,19 +91,33 @@ class _DestinationCardState extends State<DestinationCard> {
     }
   }
 
-  Future<void> _fetchDistance() async {
+  Future<void> _fetchAverageRating() async {
     try {
-      final distance =
-          await _getDistanceInKm(widget.userLocation, widget.coordinates);
-      setState(() {
-        _distanceKm = distance;
-        _isLoading = false;
-      });
+      print("🔎 Fetching reviews for destination: ${widget.name}");
+      final snapshot = await FirebaseFirestore.instance
+          .collection('reviews')
+          .where('destination', isEqualTo: widget.name)
+          .get();
+      print("🔎 Found ${snapshot.docs.length} reviews for ${widget.name}");
+      if (mounted) {
+        double total = 0;
+        int validCount = 0;
+        for (final doc in snapshot.docs) {
+          final rating = doc['rating'];
+          print(
+              "🔎 Review destination: ${doc['destination']}, rating: $rating");
+          if (rating != null && rating is num && rating > 0) {
+            total += rating.toDouble();
+            validCount++;
+          }
+        }
+        setState(() {
+          _liveRating = validCount > 0 ? total / validCount : 0;
+          _reviewCount = validCount;
+        });
+      }
     } catch (e) {
-      print("❌ Error getting distance: $e");
-      setState(() {
-        _isLoading = false;
-      });
+      print("⚠️ Could not fetch live rating: $e");
     }
   }
 
@@ -110,8 +128,14 @@ class _DestinationCardState extends State<DestinationCard> {
 
     try {
       final response = await http.get(Uri.parse(url));
+      print(
+          "🗺️ Directions status=${response.statusCode} for ${origin.latitude},${origin.longitude} -> ${destination.latitude},${destination.longitude}");
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        final status = data['status'];
+        final routeCount =
+            data['routes'] is List ? (data['routes'] as List).length : 0;
+        print("🧭 Directions result status=$status routes=$routeCount");
         if (data['routes'].isNotEmpty) {
           final distanceMeters =
               data['routes'][0]['legs'][0]['distance']['value'];
@@ -122,6 +146,37 @@ class _DestinationCardState extends State<DestinationCard> {
       print("❌ Error fetching distance from API: $e");
     }
     return null;
+  }
+
+  Future<void> _fetchDistance() async {
+    try {
+      final distance =
+          await _getDistanceInKm(widget.userLocation, widget.coordinates);
+      final resolvedDistance = distance ??
+          (Geolocator.distanceBetween(
+                widget.userLocation.latitude,
+                widget.userLocation.longitude,
+                widget.coordinates.latitude,
+                widget.coordinates.longitude,
+              ) /
+              1000.0);
+      final source = distance != null ? "google" : "geolocator";
+      if (mounted) {
+        setState(() {
+          _distanceKm = resolvedDistance;
+          _isLoading = false;
+        });
+      }
+      print(
+          "📏 ${widget.name}: ${resolvedDistance.toStringAsFixed(2)}km ($source)");
+    } catch (e) {
+      print("❌ Error getting distance: $e");
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
   }
 
   // Check if this destination is already favorited
@@ -202,76 +257,168 @@ class _DestinationCardState extends State<DestinationCard> {
               ));
         },
         child: Card(
-          elevation: 2,
+          elevation: 4,
+          shadowColor: Colors.black.withOpacity(0.15),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Colors.black54),
+            borderRadius: BorderRadius.circular(20),
           ),
           color: Colors.white,
           clipBehavior: Clip.hardEdge,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              AspectRatio(
-                aspectRatio: 16 / 9,
-                child: Image.network(widget.imageUrl, fit: BoxFit.cover),
-              ),
-              Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 25, vertical: 12),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            widget.name,
-                            style: Theme.of(context)
-                                .textTheme
-                                .titleMedium
-                                ?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                ),
+              // Image with favorite overlay
+              Stack(
+                children: [
+                  AspectRatio(
+                    aspectRatio: 16 / 9,
+                    child: Image.network(widget.imageUrl, fit: BoxFit.cover),
+                  ),
+                  // Favorite button on top-right of image
+                  if (widget.onFavorite != null || widget.onDirections != null)
+                    Positioned(
+                      top: 10,
+                      right: 10,
+                      child: Material(
+                        color: Colors.white.withOpacity(0.9),
+                        shape: const CircleBorder(),
+                        elevation: 2,
+                        child: InkWell(
+                          customBorder: const CircleBorder(),
+                          onTap: _toggleFavorite,
+                          child: Padding(
+                            padding: const EdgeInsets.all(8),
+                            child: AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 300),
+                              transitionBuilder: (child, animation) =>
+                                  ScaleTransition(
+                                      scale: animation, child: child),
+                              child: Icon(
+                                _isFavorited
+                                    ? Icons.favorite
+                                    : Icons.favorite_border,
+                                key: ValueKey(_isFavorited),
+                                color: _isFavorited
+                                    ? Colors.red
+                                    : Colors.grey[600],
+                                size: 24,
+                              ),
+                            ),
                           ),
-                          const SizedBox(height: 4),
+                        ),
+                      ),
+                    ),
+                  // Rating badge on top-left
+                  Positioned(
+                    top: 10,
+                    left: 10,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.6),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.star, color: Colors.amber, size: 16),
+                          const SizedBox(width: 4),
                           Text(
-                            (widget.onDirections != null ||
-                                    widget.onFavorite != null)
-                                ? (_isLoading
-                                    ? 'Distance: ...'
-                                    : _distanceKm != null
-                                        ? 'Distance: ${_distanceKm!.toStringAsFixed(2)} km'
-                                        : 'Distance: N/A')
-                                : widget.shortDescription,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyMedium
-                                ?.copyWith(
-                                  color: Colors.grey[600],
-                                ),
+                            _liveRating > 0
+                                ? _liveRating.toStringAsFixed(1)
+                                : 'New',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                            ),
                           ),
                         ],
                       ),
                     ),
-                    if (widget.onDirections != null ||
-                        widget.onFavorite != null)
-                      Row(
-                        children: [
-                          BadgeButton(
-                            text: 'Directions',
-                            backgroundColor: const Color(0xFF64B5F6),
+                  ),
+                ],
+              ),
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                widget.name,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleMedium
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 17,
+                                    ),
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      (widget.onDirections != null ||
+                                              widget.onFavorite != null)
+                                          ? (_isLoading
+                                              ? 'Calculating distance...'
+                                              : _distanceKm != null
+                                                  ? '${_distanceKm!.toStringAsFixed(2)} km away'
+                                                  : 'Distance: N/A')
+                                          : widget.shortDescription,
+                                      style: TextStyle(
+                                        color: Colors.grey[600],
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    // Directions CTA button - prominent and clearly a button
+                    if (widget.onDirections != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: SizedBox(
+                          width: double.infinity,
+                          height: 48,
+                          child: ElevatedButton.icon(
                             onPressed: widget.onDirections,
+                            icon: const Icon(Icons.navigation_rounded,
+                                color: Colors.white, size: 22),
+                            label: const Text(
+                              'Get Directions',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF1E88E5),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(24),
+                              ),
+                              elevation: 4,
+                              shadowColor:
+                                  const Color(0xFF1E88E5).withOpacity(0.4),
+                            ),
                           ),
-                          const SizedBox(width: 8),
-                          BadgeButton(
-                            text: _isFavorited ? 'Favorited' : 'Favorite',
-                            backgroundColor: _isFavorited
-                                ? Colors.redAccent
-                                : const Color(0xFFFFB300),
-                            onPressed: _toggleFavorite,
-                          ),
-                        ],
+                        ),
                       ),
                   ],
                 ),
@@ -279,25 +426,41 @@ class _DestinationCardState extends State<DestinationCard> {
               if (widget.showMeta)
                 Padding(
                   padding:
-                      const EdgeInsets.only(left: 25, right: 30, bottom: 16),
+                      const EdgeInsets.only(left: 16, right: 16, bottom: 14),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Row(
                         children: [
-                          const Icon(Icons.star, color: Colors.blue, size: 20),
+                          const Icon(Icons.star_rounded,
+                              color: Colors.amber, size: 20),
                           const SizedBox(width: 4),
-                          Text(widget.rating.toString(),
-                              style: const TextStyle(fontSize: 16)),
+                          Text(
+                              _liveRating > 0
+                                  ? _liveRating.toStringAsFixed(1)
+                                  : 'New',
+                              style: const TextStyle(
+                                  fontSize: 14, fontWeight: FontWeight.w600)),
                         ],
                       ),
                       _isLoading
-                          ? const Text('Distance: ...')
-                          : Text(
-                              _distanceKm != null
-                                  ? 'Distance: ${_distanceKm!.toStringAsFixed(2)} km'
-                                  : 'Distance: N/A',
-                              style: const TextStyle(fontSize: 16),
+                          ? Text('Calculating...',
+                              style: TextStyle(
+                                  fontSize: 13, color: Colors.grey[500]))
+                          : Row(
+                              children: [
+                                Icon(Icons.straighten,
+                                    size: 16, color: Colors.grey[500]),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _distanceKm != null
+                                      ? '${_distanceKm!.toStringAsFixed(2)} km'
+                                      : 'N/A',
+                                  style: const TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w500),
+                                ),
+                              ],
                             ),
                     ],
                   ),

@@ -40,6 +40,20 @@ class UseFirebase<T> {
     return _firestore.collection(collection).snapshots().map((snap) =>
         snap.docs.map((doc) => fromJson(doc.data(), doc.id)).toList());
   }
+
+  /// Streams documents from [collection] after applying a server-side query
+  /// (e.g. a `where` filter), so callers don't have to pull the whole
+  /// collection and filter client-side.
+  Stream<List<T>> streamWhere(
+    String collection,
+    Query<Map<String, dynamic>> Function(
+            CollectionReference<Map<String, dynamic>> ref)
+        buildQuery,
+  ) {
+    return buildQuery(_firestore.collection(collection)).snapshots().map(
+        (snap) =>
+            snap.docs.map((doc) => fromJson(doc.data(), doc.id)).toList());
+  }
 }
 
 extension UseFirebaseSubcollection<T> on UseFirebase<T> {
