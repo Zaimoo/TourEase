@@ -103,10 +103,12 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
         _userLocation!,
         destination.latLng,
       );
-      if (distance != null) {
-        _destinationDistances[destination.id] = distance;
-        print("   ${destination.name}: ${distance.toStringAsFixed(2)}km");
-      }
+      final resolvedDistance =
+          distance ?? (_calculateDistance(destination.latLng) / 1000.0);
+      final source = distance != null ? "google" : "geolocator";
+      _destinationDistances[destination.id] = resolvedDistance;
+      print(
+          "   ${destination.name}: ${resolvedDistance.toStringAsFixed(2)}km ($source)");
     }
 
     setState(() {}); // Trigger rebuild with new distances
@@ -120,8 +122,14 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
 
     try {
       final response = await http.get(Uri.parse(url));
+      print(
+          "🗺️ Directions status=${response.statusCode} for ${origin.latitude},${origin.longitude} -> ${destination.latitude},${destination.longitude}");
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        final status = data['status'];
+        final routeCount =
+            data['routes'] is List ? (data['routes'] as List).length : 0;
+        print("🧭 Directions result status=$status routes=$routeCount");
         if (data['routes'].isNotEmpty) {
           final distanceMeters =
               data['routes'][0]['legs'][0]['distance']['value'];
@@ -472,7 +480,8 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                      builder: (context) => const SettingsScreen()),
+                      builder: (context) => SettingsScreen(
+                          isAdmin: _currentUser?.isAdmin ?? false)),
                 );
               },
               onLogout: _handleLogout,

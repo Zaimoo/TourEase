@@ -59,14 +59,11 @@ class _DestinationInfoScreenState extends State<DestinationInfoScreen> {
   );
 
   bool _isFavorited = false;
-  double _liveRating = 0;
-  int _reviewCount = 0;
 
   @override
   void initState() {
     super.initState();
     _checkIfFavorited();
-    _fetchAverageRating();
   }
 
   Future<void> _checkIfFavorited() async {
@@ -115,37 +112,32 @@ class _DestinationInfoScreenState extends State<DestinationInfoScreen> {
     }
   }
 
-  Future<void> _fetchAverageRating() async {
-    try {
-      final snapshot = await FirebaseFirestore.instance
-          .collection('reviews')
-          .where('destination', isEqualTo: widget.name)
-          .get();
-      double total = 0;
-      int validCount = 0;
-      for (final doc in snapshot.docs) {
-        final rating = doc['rating'];
-        if (rating != null && rating is num && rating > 0) {
-          total += rating.toDouble();
-          validCount++;
-        }
-      }
-      setState(() {
-        _liveRating = validCount > 0 ? total / validCount : 0;
-        _reviewCount = validCount;
-      });
-    } catch (e) {
-      print("⚠️ Could not fetch live rating: $e");
-    }
+  /// Streams every review for [destination] (server-side filtered), newest
+  /// first. Legacy reviews without a timestamp sort last.
+  Stream<List<Review>> _streamReviewsForDestination(String destination) {
+    return reviewService
+        .streamWhere(
+          'reviews',
+          (ref) => ref.where('destination', isEqualTo: destination),
+        )
+        .map((reviews) {
+      reviews.sort((a, b) => (b.createdAt ?? DateTime(0))
+          .compareTo(a.createdAt ?? DateTime(0)));
+      return reviews;
+    });
+  }
+
+  /// Average rating across reviews that carry a positive score.
+  double _averageRating(List<Review> reviews) {
+    final rated = reviews.where((r) => r.rating > 0).toList();
+    if (rated.isEmpty) return 0;
+    final total = rated.fold<double>(0, (acc, r) => acc + r.rating);
+    return total / rated.length;
   }
 
   Stream<List<Review>> getReviewsForDestination(String destination) {
-    return reviewService.streamAll('reviews').map(
-          (allReviews) => allReviews
-              .where((review) => review.destination == destination)
-              .take(3)
-              .toList(),
-        );
+    return _streamReviewsForDestination(destination)
+        .map((reviews) => reviews.take(3).toList());
   }
 
   @override
@@ -330,21 +322,26 @@ class _DestinationInfoScreenState extends State<DestinationInfoScreen> {
                         color: Colors.black.withOpacity(0.6),
                         borderRadius: BorderRadius.circular(16),
                       ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.star, color: Colors.amber, size: 18),
-                          const SizedBox(width: 4),
-                          Text(
-                            _liveRating > 0
-                                ? _liveRating.toStringAsFixed(1)
-                                : 'New',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 15,
-                            ),
-                          ),
-                        ],
+                      child: StreamBuilder<List<Review>>(
+                        stream: _streamReviewsForDestination(widget.name),
+                        builder: (context, snapshot) {
+                          final avg = _averageRating(snapshot.data ?? []);
+                          return Row(
+                            children: [
+                              const Icon(Icons.star,
+                                  color: Colors.amber, size: 18),
+                              const SizedBox(width: 4),
+                              Text(
+                                avg > 0 ? avg.toStringAsFixed(1) : 'New',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                            ],
+                          );
+                        },
                       ),
                     ),
                   ),
@@ -498,6 +495,8 @@ class _DestinationInfoScreenState extends State<DestinationInfoScreen> {
                                 review: r.review,
                                 rating: r.rating,
                                 profileUrl: imageUrl,
+                                verified: r.verified,
+                                photoUrls: r.photoUrls,
                               );
                             }).toList(),
                           );

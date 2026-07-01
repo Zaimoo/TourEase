@@ -11,6 +11,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:tourease/models/destination.dart';
+import 'package:tourease/models/fare_config.dart';
 import 'package:tourease/models/task.dart';
 import 'package:tourease/models/transportation_markers.dart';
 import 'package:tourease/models/user.dart';
@@ -123,6 +124,15 @@ class _MapScreenState extends State<MapScreen>
 
   final UseAuth _authService = UseAuth();
 
+  final fareConfigService = UseFirebase<FareConfig>(
+    fromJson: (data, id) => FareConfig.fromJson(data, id),
+    toJson: (model) => model.toJson(),
+  );
+
+  // Editable fare rates (loaded from Firestore `config/fares`). Initialized to
+  // the shipped defaults so fare math works before/if the doc never loads.
+  FareConfig _fareConfig = FareConfig.defaults();
+
   Set<Marker> _markers = {};
   Set<Polyline> _polylines = {};
   Destination? _selectedDestination;
@@ -202,9 +212,23 @@ class _MapScreenState extends State<MapScreen>
       _userLocation = widget.userLocation;
     }
     _restoreNavState();
+    _loadFareConfig();
     _loadDestinations();
     _loadTransportationMarkers();
     loadUserProfile();
+  }
+
+  /// Loads admin-editable fare rates. Falls back to defaults if the doc is
+  /// missing or the fetch fails, so fare calculations never break.
+  Future<void> _loadFareConfig() async {
+    try {
+      final config = await fareConfigService.getById('config', 'fares');
+      if (config != null && mounted && !_disposed) {
+        setState(() => _fareConfig = config);
+      }
+    } catch (e) {
+      print('⚠️ Could not load fare config, using defaults: $e');
+    }
   }
 
   @override
@@ -266,43 +290,49 @@ class _MapScreenState extends State<MapScreen>
   }
 
   void _loadTransportationMarkers() {
-    transportationService
-        .streamAll('transportationMarkers')
-        .listen((vehicles) async {
+    transportationService.streamAll('transportationMarkers').listen(
+        (vehicles) async {
+      print("🚐 transportationMarkers count: ${vehicles.length}");
       final markerFutures = vehicles.map((vehicle) async {
-        BitmapDescriptor icon;
-        print("vehicleType: ${vehicle.vehicleType}");
-        print(
-            "coordinates: ${vehicle.latLng.latitude}, ${vehicle.latLng.longitude}");
-        // Choose icon based on vehicle type
-        switch (vehicle.vehicleType.toLowerCase()) {
-          case 'jeepney':
-            icon = await createBubbleMarker('assets/jeepney.png');
-            break;
-          case 'habal':
-            icon = await createBubbleMarker('assets/habal.png');
-            break;
-          case 'sikad':
-            icon = await createBubbleMarker('assets/sikad.png');
-            break;
-          default:
-            icon = BitmapDescriptor.defaultMarker;
-        }
+        try {
+          BitmapDescriptor icon;
+          print("vehicleType: ${vehicle.vehicleType}");
+          print(
+              "coordinates: ${vehicle.latLng.latitude}, ${vehicle.latLng.longitude}");
+          // Choose icon based on vehicle type
+          switch (vehicle.vehicleType.toLowerCase()) {
+            case 'jeepney':
+              icon = await createBubbleMarker('assets/jeepney.png');
+              break;
+            case 'habal':
+              icon = await createBubbleMarker('assets/habal.png');
+              break;
+            case 'sikad':
+              icon = await createBubbleMarker('assets/sikad.png');
+              break;
+            default:
+              icon = BitmapDescriptor.defaultMarker;
+          }
 
-        return Marker(
-          markerId: MarkerId(vehicle.id),
-          position: LatLng(
-            vehicle.latLng.latitude,
-            vehicle.latLng.longitude,
-          ),
-          icon: icon,
-          infoWindow: InfoWindow(
-            title: vehicle.vehicleType,
-          ),
-        );
+          return Marker(
+            markerId: MarkerId(vehicle.id),
+            position: LatLng(
+              vehicle.latLng.latitude,
+              vehicle.latLng.longitude,
+            ),
+            icon: icon,
+            infoWindow: InfoWindow(
+              title: vehicle.vehicleType,
+            ),
+          );
+        } catch (e) {
+          print("❌ Failed to build marker for ${vehicle.id}: $e");
+          return null;
+        }
       }).toList();
 
-      final markers = await Future.wait(markerFutures);
+      final markers =
+          (await Future.wait(markerFutures)).whereType<Marker>().toSet();
 
       if (!_disposed && mounted) {
         setState(() {
@@ -312,6 +342,8 @@ class _MapScreenState extends State<MapScreen>
           }; // merge with existing destination markers
         });
       }
+    }, onError: (error) {
+      print("❌ transportationMarkers stream error: $error");
     });
   }
 
@@ -697,6 +729,32 @@ class _MapScreenState extends State<MapScreen>
     return nearestHabal;
   }
 
+  Future<TransportationMarkers?> _findNearestSikad(LatLng userLocation) async {
+    final sikadMarkers =
+        await transportationService.getAll('transportationMarkers');
+    final filtered =
+        sikadMarkers.where((m) => m.vehicleType.toLowerCase() == 'sikad');
+
+    double shortestDistance = double.infinity;
+    TransportationMarkers? nearestSikad;
+
+    for (final marker in filtered) {
+      final dist = calculateDistance(
+        userLocation.latitude,
+        userLocation.longitude,
+        marker.coordinates.latitude,
+        marker.coordinates.longitude,
+      );
+
+      if (dist < shortestDistance) {
+        shortestDistance = dist;
+        nearestSikad = marker;
+      }
+    }
+
+    return nearestSikad;
+  }
+
   Future<List<LatLng>> _fetchPolyline(LatLng origin, LatLng destination,
       {String mode = "driving"}) async {
     const String apiKey = "AIzaSyALUtzfv48mrHdqP1PuSk36jwPKlddxSYk";
@@ -834,7 +892,6 @@ class _MapScreenState extends State<MapScreen>
     final destination = _selectedDestination;
     final user = _currentUser;
     final polylines = Set<Polyline>.from(_polylines);
-    final userLoc = _userLocation;
 
     // Clear task state so the UI stops showing the task card
     if (!_disposed && mounted) {
@@ -861,43 +918,85 @@ class _MapScreenState extends State<MapScreen>
     // Save trip to history
     if (user != null && destination != null) {
       try {
-        // Calculate total distance traveled
+        // Total route distance: sum the geodesic length of every polyline
+        // segment that made up the trip. Measuring the straight line from the
+        // user's end position to the destination would always be ~0, since the
+        // trip only completes once the user is inside the destination geofence.
         double? totalDistance;
-        if (userLoc != null) {
-          totalDistance = Geolocator.distanceBetween(
-                userLoc.latitude,
-                userLoc.longitude,
-                destination.latLng.latitude,
-                destination.latLng.longitude,
-              ) /
-              1000; // Convert to km
+        if (polylines.isNotEmpty) {
+          double meters = 0;
+          for (final polyline in polylines) {
+            final pts = polyline.points;
+            for (int i = 0; i < pts.length - 1; i++) {
+              meters += Geolocator.distanceBetween(
+                pts[i].latitude,
+                pts[i].longitude,
+                pts[i + 1].latitude,
+                pts[i + 1].longitude,
+              );
+            }
+          }
+          totalDistance = meters / 1000; // Convert to km
         }
 
-        // Determine transport mode from polyline colors or default
+        // Verify on-site presence with a fresh GPS reading. A trip only
+        // counts as "verified" if the user is physically inside the
+        // destination geofence and the location is not mocked. This is the
+        // signal that gates reviewing (prevents paid/remote reviews).
+        const double geofenceRadiusMeters = 150;
+        bool verifiedOnSite = false;
+        try {
+          final pos = await Geolocator.getCurrentPosition(
+            desiredAccuracy: LocationAccuracy.high,
+          );
+          final distanceToDest = Geolocator.distanceBetween(
+            pos.latitude,
+            pos.longitude,
+            destination.latLng.latitude,
+            destination.latLng.longitude,
+          );
+          verifiedOnSite =
+              !pos.isMocked && distanceToDest <= geofenceRadiusMeters;
+          print('On-site check: ${distanceToDest.toStringAsFixed(1)}m away, '
+              'mocked=${pos.isMocked}, verified=$verifiedOnSite');
+        } catch (e) {
+          print('⚠️ Could not verify on-site presence: $e');
+        }
+
+        // Determine transport mode(s) from the rendered polyline colors.
+        // Multimodal trips have several colors, so collect every distinct mode
+        // present and drop pure walking legs when an actual ride is involved.
         String transportMode = 'Mixed';
         if (polylines.isNotEmpty) {
-          final colors = polylines.map((p) => p.color).toSet();
-          if (colors.length == 1) {
-            final color = colors.first;
-            if (color == Colors.orange)
-              transportMode = 'Walking';
-            else if (color == Colors.green)
-              transportMode = 'Habal-Habal';
-            else if (color == Colors.blue)
-              transportMode = 'Direct';
-            else if (color == Colors.purple || color == Colors.blueAccent)
-              transportMode = 'Jeepney';
+          final modes = <String>{};
+          for (final color in polylines.map((p) => p.color)) {
+            if (color == Colors.orange) {
+              modes.add('Walking');
+            } else if (color == Colors.green) {
+              modes.add('Habal-Habal');
+            } else if (color == Colors.blue) {
+              modes.add('Direct');
+            } else if (color == Colors.purple || color == Colors.blueAccent) {
+              modes.add('Jeepney');
+            }
+          }
+          final rideModes = modes.where((m) => m != 'Walking').toList();
+          if (rideModes.isNotEmpty) {
+            transportMode = rideModes.join(' + ');
+          } else if (modes.contains('Walking')) {
+            transportMode = 'Walking';
           }
         }
 
         final trip = Trip(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
           destinationName: destination.name,
-          destinationId: destination.name,
+          destinationId: destination.id,
           visitedDate: DateTime.now(),
           imageUrl: destination.imageUrl,
           distance: totalDistance,
           transportMode: transportMode,
+          verifiedOnSite: verifiedOnSite,
         );
 
         await tripService.addToSubcollection(
@@ -909,6 +1008,16 @@ class _MapScreenState extends State<MapScreen>
         );
 
         print('✅ Trip saved to history');
+
+        if (!_disposed && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(verifiedOnSite
+                  ? 'Visit verified on-site — you can now review this place!'
+                  : 'Trip saved, but your location couldn’t be verified on-site, so reviewing stays locked.'),
+            ),
+          );
+        }
       } catch (e) {
         print('❌ Error saving trip: $e');
       }
@@ -1201,32 +1310,63 @@ class _MapScreenState extends State<MapScreen>
   // ========== FARE CALCULATION METHODS ==========
 
   double calculateJeepneyFare(double distanceKm) {
-    if (distanceKm <= 4.0) {
-      return 13.0;
+    final c = _fareConfig;
+    if (distanceKm <= c.jeepneyBaseDistanceKm) {
+      return c.jeepneyBaseFare;
     } else {
-      double succeedingKm = distanceKm - 4.0;
-      return (13.0 + (succeedingKm * 1.8)).roundToDouble();
+      double succeedingKm = distanceKm - c.jeepneyBaseDistanceKm;
+      return (c.jeepneyBaseFare + (succeedingKm * c.jeepneyPerKm))
+          .roundToDouble();
     }
   }
 
   double calculateHabalFare(double distanceKm) {
-    if (distanceKm <= 2.0) {
-      return 50.0;
-    } else if (distanceKm <= 8.0) {
-      double succeedingKm = distanceKm - 2.0;
-      return 50.0 + (9.0 * succeedingKm);
+    final c = _fareConfig;
+    if (distanceKm <= c.habalBaseDistanceKm) {
+      return c.habalBaseFare;
+    } else if (distanceKm <= c.habalTier1LimitKm) {
+      double succeedingKm = distanceKm - c.habalBaseDistanceKm;
+      return c.habalBaseFare + (c.habalTier1PerKm * succeedingKm);
     } else {
-      double succeedingKm = distanceKm - 8.0;
-      return 50.0 + (9.0 * 6.0) + (15.0 * succeedingKm);
+      double tier1Km = c.habalTier1LimitKm - c.habalBaseDistanceKm;
+      double succeedingKm = distanceKm - c.habalTier1LimitKm;
+      return c.habalBaseFare +
+          (c.habalTier1PerKm * tier1Km) +
+          (c.habalTier2PerKm * succeedingKm);
     }
   }
 
   double calculateSikadFare(double distanceKm) {
-    return 15.0; // Placeholder
+    final c = _fareConfig;
+    if (distanceKm <= c.sikadBaseDistanceKm) return c.sikadBaseFare;
+    final extraBlocks =
+        ((distanceKm - c.sikadBaseDistanceKm) / c.sikadBlockSizeKm).ceil();
+    return c.sikadBaseFare + (extraBlocks * c.sikadPerBlock);
   }
 
   double calculateWalkingFare(double distanceKm) {
     return 0.0;
+  }
+
+  /// Formats a computed fare as a range string (the computed fare is the low
+  /// end, plus the configured spread), e.g. ₱13 -> "₱13–₱18". Zero fares
+  /// (walking) render as "Free".
+  String formatFareRange(double fare) {
+    if (fare <= 0) return 'Free';
+    final base = fare.round();
+    final high = base + _fareConfig.rangeSpread.round();
+    return '₱$base–₱$high';
+  }
+
+  static const double _multimodalWalkPenaltyThreshold200m = 0.2;
+  double _walkingPenaltyMultimodal(double walk200m) {
+    if (walk200m <= _multimodalWalkPenaltyThreshold200m) return 0.0;
+    return (walk200m - _multimodalWalkPenaltyThreshold200m) * 1.4;
+  }
+
+  double _walkingPenaltyHabalMultimodal(double walk200m) {
+    if (walk200m <= _multimodalWalkPenaltyThreshold200m) return 0.0;
+    return (walk200m - _multimodalWalkPenaltyThreshold200m) * 3.2;
   }
 
   // Calculate weighted score with 6:4 ratio (fare:distance)
@@ -1244,7 +1384,7 @@ class _MapScreenState extends State<MapScreen>
         maxFare = 370.0; // Habal max: (14.19 × 25) + 16.43 = ₱371 for 25km
         break;
       case "sikad":
-        maxFare = 15.0; // Sikad flat ₱15 (not for long distances)
+        maxFare = 30.0; // Sikad max at 2km
         break;
       case "walking":
         maxFare = 1.0;
@@ -1266,7 +1406,7 @@ class _MapScreenState extends State<MapScreen>
     double normalizedDistance = (totalDistance / 25.0) * 10;
 
     // Apply 6:4 weighting (fare gets 60%, distance gets 40%)
-    // Lower score is better
+    // Lower score is better5il
     double score = (normalizedFare * 0.6) + (normalizedDistance * 0.4);
 
     return score;
@@ -1316,7 +1456,7 @@ class _MapScreenState extends State<MapScreen>
     const walkPenaltyThreshold200m = 0.2;
     double _walkingPenalty(double walk200m) {
       if (walk200m <= walkPenaltyThreshold200m) return 0.0;
-      return (walk200m - walkPenaltyThreshold200m) * 3;
+      return (walk200m - walkPenaltyThreshold200m) * 3.2;
     }
 
     // ─── 1️⃣ Try to find a single route that serves both points ───
@@ -1723,9 +1863,9 @@ class _MapScreenState extends State<MapScreen>
 
     print("🌐 Multimodal: Distance = ${distance.toStringAsFixed(2)} km");
 
-    // Short distance (< 1 km) - Just walk
+// Short distance (< 1 km) - Walking or Sikad if faster/cheaper
     if (distance < 1.0) {
-      await _setupWalkingRoute(userLocation, destination);
+      await _setupShortDistanceRoute(userLocation, destination);
       return;
     }
 
@@ -1737,6 +1877,85 @@ class _MapScreenState extends State<MapScreen>
 
     // Long distance (3+ km) - Try combined modes
     await _setupLongDistanceRoute(userLocation, destination);
+  }
+
+  Future<void> _setupShortDistanceRoute(
+      LatLng userLocation, LatLng destination) async {
+    print("📏 Short distance — comparing Walking vs Sikad");
+
+    final tripDistance = calculateDistance(
+      userLocation.latitude,
+      userLocation.longitude,
+      destination.latitude,
+      destination.longitude,
+    );
+
+    // --- Walking score (with penalty so heavy walking is deprioritised) ---
+    final walkPenalty = _walkingPenaltyMultimodal(tripDistance * 5);
+    final walkingScore =
+        calculateRouteScore(tripDistance, 0.0, mode: "walking") + walkPenalty;
+
+    print("🚶 Walking: ${tripDistance.toStringAsFixed(2)}km, ₱0, "
+        "Penalty: ${walkPenalty.toStringAsFixed(2)}, "
+        "Score: ${walkingScore.toStringAsFixed(2)}");
+
+    // --- Sikad score (only if enabled and ride distance is within the 2km cap) ---
+    double sikadScore = double.infinity;
+    TransportationMarkers? nearestSikad;
+    final canUseSikad = _transportPreferences["sikad"] ?? false;
+
+    if (canUseSikad) {
+      nearestSikad = await _findNearestSikad(userLocation);
+      if (nearestSikad != null) {
+        final walkToSikad = calculateDistance(
+          userLocation.latitude,
+          userLocation.longitude,
+          nearestSikad.latLng.latitude,
+          nearestSikad.latLng.longitude,
+        );
+        final sikadRide = calculateDistance(
+          nearestSikad.latLng.latitude,
+          nearestSikad.latLng.longitude,
+          destination.latitude,
+          destination.longitude,
+        );
+
+        // Sikad has a hard 2km cap — skip if the ride leg would exceed it
+        if (sikadRide <= 2.0) {
+          final fare = calculateSikadFare(sikadRide);
+          // Apply walking penalty only to the walk-to-sikad leg, not the ride leg
+          final walkPenaltySikad = _walkingPenaltyMultimodal(walkToSikad * 5);
+          sikadScore = calculateRouteScore(walkToSikad + sikadRide, fare,
+                  mode: "sikad") +
+              walkPenaltySikad;
+
+          print("🚲 Sikad: walk ${walkToSikad.toStringAsFixed(2)}km + "
+              "ride ${sikadRide.toStringAsFixed(2)}km, "
+              "₱${fare.toStringAsFixed(0)}, "
+              "Penalty: ${walkPenaltySikad.toStringAsFixed(2)}, "
+              "Score: ${sikadScore.toStringAsFixed(2)}");
+        } else {
+          print(
+              "🚲 Sikad excluded: ride leg ${sikadRide.toStringAsFixed(2)}km > 2km cap");
+        }
+      } else {
+        print("🚲 Sikad excluded: no nearby sikad found");
+      }
+    } else {
+      print("🚲 Sikad excluded: disabled in preferences");
+    }
+
+    // --- Pick winner ---
+    if (sikadScore < walkingScore) {
+      print("✅ Best short-distance option: Sikad "
+          "(score ${sikadScore.toStringAsFixed(2)} < ${walkingScore.toStringAsFixed(2)})");
+      await _setupSikadRouteWithPolylines(
+          userLocation, nearestSikad!.latLng, destination);
+    } else {
+      print("✅ Best short-distance option: Walking "
+          "(score ${walkingScore.toStringAsFixed(2)})");
+      await _setupWalkingRoute(userLocation, destination);
+    }
   }
 
   Future<void> _setupWalkingRoute(
@@ -1830,12 +2049,15 @@ class _MapScreenState extends State<MapScreen>
     // Check user preferences
     final canUseHabal = _transportPreferences["habal"] ?? false;
     final canUseJeepney = _transportPreferences["jeepney"] ?? false;
+    final canUseSikad = _transportPreferences["sikad"] ?? false;
 
     // Option 1: Walking
     double walkingDistance = tripDistance;
     double walkingFare = calculateWalkingFare(walkingDistance);
+    final walkingPenalty = _walkingPenaltyMultimodal(walkingDistance * 5);
     double walkingScore =
-        calculateRouteScore(walkingDistance, walkingFare, mode: "walking");
+        calculateRouteScore(walkingDistance, walkingFare, mode: "walking") +
+            walkingPenalty;
     print(
         "🚶 Walking: ${walkingDistance.toStringAsFixed(2)}km, ₱${walkingFare.toStringAsFixed(0)}, Score: ${walkingScore.toStringAsFixed(2)}");
 
@@ -1857,10 +2079,14 @@ class _MapScreenState extends State<MapScreen>
           destination.latitude,
           destination.longitude,
         );
+
+        final walkPenaltyHabal =
+            _walkingPenaltyHabalMultimodal(walkToHabal * 5);
         final habalDistance = walkToHabal + habalRide;
         final habalFare = calculateHabalFare(habalRide);
         habalScore =
-            calculateRouteScore(habalDistance, habalFare, mode: "habal");
+            calculateRouteScore(habalDistance, habalFare, mode: "habal") +
+                walkPenaltyHabal;
         print(
             "🏍️ Habal: ${habalDistance.toStringAsFixed(2)}km, ₱${habalFare.toStringAsFixed(0)}, Score: ${habalScore.toStringAsFixed(2)}");
       }
@@ -1872,43 +2098,110 @@ class _MapScreenState extends State<MapScreen>
     if (canUseJeepney) {
       try {
         jeepneyResult = await _getJeepneyRoutes(userLocation, destination);
-        final jeepneyRoutes = jeepneyResult["routes"] as List<JeepneyRoute>;
-        final firstRoute = jeepneyRoutes[0];
+        final routes = jeepneyResult["routes"] as List<JeepneyRoute>;
+        final type = jeepneyResult["type"] as String;
+        final firstRoute = routes[0];
 
-        final jeepneyPickup = _findNearestPoint(
-          firstRoute.points
-              .map((p) => LatLng(p.latitude, p.longitude))
-              .toList(),
-          userLocation,
-        );
-
+        final startPoint =
+            _findNearestPoint(firstRoute.latLngPoints, userLocation);
         final walkToJeepney = calculateDistance(
           userLocation.latitude,
           userLocation.longitude,
-          jeepneyPickup.latitude,
-          jeepneyPickup.longitude,
+          startPoint.latitude,
+          startPoint.longitude,
         );
 
-        final jeepneyRide = calculateDistance(
-          jeepneyPickup.latitude,
-          jeepneyPickup.longitude,
-          destination.latitude,
-          destination.longitude,
-        );
+        double rideDist;
+        double totalFare;
+        String scoreMode;
 
-        final jeepneyDistance = walkToJeepney + jeepneyRide;
-        final jeepneyFare = calculateJeepneyFare(jeepneyRide);
+        if (type == "single") {
+          final nearestToDest =
+              _findNearestPoint(firstRoute.latLngPoints, destination);
+          rideDist = calculateDistance(
+            startPoint.latitude,
+            startPoint.longitude,
+            nearestToDest.latitude,
+            nearestToDest.longitude,
+          );
+          totalFare = calculateJeepneyFare(rideDist);
+          scoreMode = "jeepney";
+        } else {
+          final transferPointA = jeepneyResult["transferPointA"] as LatLng;
+          final transferPointB = jeepneyResult["transferPointB"] as LatLng;
+          final secondRoute = routes[1];
+          final nearestToDest =
+              _findNearestPoint(secondRoute.latLngPoints, destination);
+
+          final legA = calculateDistance(
+            startPoint.latitude,
+            startPoint.longitude,
+            transferPointA.latitude,
+            transferPointA.longitude,
+          );
+          final legB = calculateDistance(
+            transferPointB.latitude,
+            transferPointB.longitude,
+            nearestToDest.latitude,
+            nearestToDest.longitude,
+          );
+
+          rideDist = legA + legB;
+          totalFare = calculateJeepneyFare(legA) + calculateJeepneyFare(legB);
+          scoreMode = "jeepney+jeepney";
+        }
+
+        final totalDist = walkToJeepney + rideDist;
         jeepneyScore =
-            calculateRouteScore(jeepneyDistance, jeepneyFare, mode: "jeepney");
+            calculateRouteScore(totalDist, totalFare, mode: scoreMode);
         print(
-            "🚎 Jeepney: ${jeepneyDistance.toStringAsFixed(2)}km, ₱${jeepneyFare.toStringAsFixed(0)}, Score: ${jeepneyScore.toStringAsFixed(2)}");
+            "🚎 Jeepney: ${totalDist.toStringAsFixed(2)}km, ₱${totalFare.toStringAsFixed(0)}, Score: ${jeepneyScore.toStringAsFixed(2)}");
       } catch (e) {
         print("⚠️ No jeepney routes available");
       }
     }
 
+    // Option 4: Sikad (<= 2km)
+    double sikadScore = double.infinity;
+    TransportationMarkers? nearestSikad;
+    if (canUseSikad && tripDistance <= 2.0) {
+      nearestSikad = await _findNearestSikad(userLocation);
+      if (nearestSikad != null) {
+        final walkToSikad = calculateDistance(
+          userLocation.latitude,
+          userLocation.longitude,
+          nearestSikad.latLng.latitude,
+          nearestSikad.latLng.longitude,
+        );
+        final sikadRide = calculateDistance(
+          nearestSikad.latLng.latitude,
+          nearestSikad.latLng.longitude,
+          destination.latitude,
+          destination.longitude,
+        );
+        if (sikadRide <= 2.0) {
+          final fare = calculateSikadFare(sikadRide);
+          final walkPenalty = _walkingPenaltyMultimodal(walkToSikad * 5);
+          sikadScore = calculateRouteScore(walkToSikad + sikadRide, fare,
+                  mode: "sikad") +
+              walkPenalty;
+          print(
+              "🚲 Sikad: ${(walkToSikad + sikadRide).toStringAsFixed(2)}km, ₱${fare.toStringAsFixed(0)}, Score: ${sikadScore.toStringAsFixed(2)}");
+        }
+      }
+    }
+
     // Choose the option with the best score (lowest)
-    if (jeepneyScore <= walkingScore && jeepneyScore <= habalScore) {
+    if (sikadScore <= jeepneyScore &&
+        sikadScore <= habalScore &&
+        sikadScore <= walkingScore) {
+      print("✅ Best option: Sikad");
+      await _setupSikadRouteWithPolylines(
+        userLocation,
+        nearestSikad!.latLng,
+        destination,
+      );
+    } else if (jeepneyScore <= walkingScore && jeepneyScore <= habalScore) {
       print("✅ Best option: Jeepney");
       await _setupJeepneyRouteWithPolylines(userLocation, destination);
     } else if (habalScore <= walkingScore) {
@@ -1936,9 +2229,14 @@ class _MapScreenState extends State<MapScreen>
     final canUseHabal = _transportPreferences["habal"] ?? false;
     final canUseJeepney = _transportPreferences["jeepney"] ?? false;
 
+    final walkingPenalty = _walkingPenaltyMultimodal(tripDistance * 5);
+    final walkingScore =
+        calculateRouteScore(tripDistance, 0.0, mode: "walking") +
+            walkingPenalty;
+
     // Store all route options with their scores
     Map<String, dynamic> bestOption = {
-      "score": double.infinity,
+      "score": walkingScore,
       "name": "Walking",
       "action": () => _setupWalkingRoute(userLocation, destination),
     };
@@ -1948,6 +2246,11 @@ class _MapScreenState extends State<MapScreen>
     Map<String, dynamic>? jeepneyResult;
     LatLng? jeepneyPickup;
     LatLng? jeepneyDropoff;
+    double jeepneyRideDistance = 0.0;
+    double jeepneyFare = 0.0;
+    double walkToJeepney = 0.0;
+    double walkFromJeepney = 0.0;
+    String jeepneyMode = "jeepney";
 
     if (canUseHabal) {
       nearestHabal = await _findNearestHabal(userLocation);
@@ -1956,18 +2259,65 @@ class _MapScreenState extends State<MapScreen>
     if (canUseJeepney) {
       try {
         jeepneyResult = await _getJeepneyRoutes(userLocation, destination);
-        final firstRoute = jeepneyResult["routes"][0] as JeepneyRoute;
+        final routes = jeepneyResult["routes"] as List<JeepneyRoute>;
+        final type = jeepneyResult["type"] as String;
+        final firstRoute = routes[0];
+
         jeepneyPickup = _findNearestPoint(
-          firstRoute.points
-              .map((p) => LatLng(p.latitude, p.longitude))
-              .toList(),
+          firstRoute.latLngPoints,
           userLocation,
         );
-        jeepneyDropoff = _findNearestPoint(
-          firstRoute.points
-              .map((p) => LatLng(p.latitude, p.longitude))
-              .toList(),
-          destination,
+        walkToJeepney = calculateDistance(
+          userLocation.latitude,
+          userLocation.longitude,
+          jeepneyPickup.latitude,
+          jeepneyPickup.longitude,
+        );
+
+        if (type == "single") {
+          jeepneyDropoff = _findNearestPoint(
+            firstRoute.latLngPoints,
+            destination,
+          );
+          jeepneyRideDistance = calculateDistance(
+            jeepneyPickup.latitude,
+            jeepneyPickup.longitude,
+            jeepneyDropoff.latitude,
+            jeepneyDropoff.longitude,
+          );
+          jeepneyFare = calculateJeepneyFare(jeepneyRideDistance);
+          jeepneyMode = "jeepney";
+        } else {
+          final transferPointA = jeepneyResult["transferPointA"] as LatLng;
+          final transferPointB = jeepneyResult["transferPointB"] as LatLng;
+          final secondRoute = routes[1];
+
+          jeepneyDropoff = _findNearestPoint(
+            secondRoute.latLngPoints,
+            destination,
+          );
+          final legA = calculateDistance(
+            jeepneyPickup.latitude,
+            jeepneyPickup.longitude,
+            transferPointA.latitude,
+            transferPointA.longitude,
+          );
+          final legB = calculateDistance(
+            transferPointB.latitude,
+            transferPointB.longitude,
+            jeepneyDropoff.latitude,
+            jeepneyDropoff.longitude,
+          );
+          jeepneyRideDistance = legA + legB;
+          jeepneyFare = calculateJeepneyFare(legA) + calculateJeepneyFare(legB);
+          jeepneyMode = "jeepney+jeepney";
+        }
+
+        walkFromJeepney = calculateDistance(
+          jeepneyDropoff.latitude,
+          jeepneyDropoff.longitude,
+          destination.latitude,
+          destination.longitude,
         );
       } catch (e) {
         print("⚠️ Jeepney routes unavailable: $e");
@@ -2010,31 +2360,9 @@ class _MapScreenState extends State<MapScreen>
 
     // === OPTION 2: Walk + Jeepney (Basic) ===
     if (canUseJeepney && jeepneyPickup != null && jeepneyDropoff != null) {
-      final walkToJeepney = calculateDistance(
-        userLocation.latitude,
-        userLocation.longitude,
-        jeepneyPickup.latitude,
-        jeepneyPickup.longitude,
-      );
-      final jeepneyRide = calculateDistance(
-        jeepneyPickup.latitude,
-        jeepneyPickup.longitude,
-        jeepneyDropoff.latitude,
-        jeepneyDropoff.longitude,
-      );
-      final walkFromJeepney = calculateDistance(
-        jeepneyDropoff.latitude,
-        jeepneyDropoff.longitude,
-        destination.latitude,
-        destination.longitude,
-      );
-      final totalDistance = walkToJeepney + jeepneyRide + walkFromJeepney;
-      final fare = calculateJeepneyFare(jeepneyRide);
-
-      // Check if it's single or double jeepney route
-      final jeepneyType = jeepneyResult!["type"] as String;
-      final jeepneyMode =
-          jeepneyType == "single" ? "jeepney" : "jeepney+jeepney";
+      final totalDistance =
+          walkToJeepney + jeepneyRideDistance + walkFromJeepney;
+      final fare = jeepneyFare;
       final score = calculateRouteScore(totalDistance, fare, mode: jeepneyMode);
 
       print(
@@ -2093,10 +2421,10 @@ class _MapScreenState extends State<MapScreen>
             destination.longitude,
           );
           final totalDistanceWithHabal =
-              walkToJeepney + jeepneyRide + habalToDestination;
-          final jeepneyFare = calculateJeepneyFare(jeepneyRide);
+              walkToJeepney + jeepneyRideDistance + habalToDestination;
+          final baseJeepneyFare = jeepneyFare;
           final habalFare = calculateHabalFare(habalToDestination);
-          final totalFare = jeepneyFare + habalFare;
+          final totalFare = baseJeepneyFare + habalFare;
           final scoreWithHabal = calculateRouteScore(
               totalDistanceWithHabal, totalFare,
               mode: "jeepney+habal");
@@ -2132,22 +2460,17 @@ class _MapScreenState extends State<MapScreen>
           jeepneyPickup.latitude,
           jeepneyPickup.longitude,
         );
-        final jeepneyRide = calculateDistance(
-          jeepneyPickup.latitude,
-          jeepneyPickup.longitude,
-          jeepneyDropoff.latitude,
-          jeepneyDropoff.longitude,
-        );
         final walkFromJeepney = calculateDistance(
           jeepneyDropoff.latitude,
           jeepneyDropoff.longitude,
           destination.latitude,
           destination.longitude,
         );
-        final totalDistance =
-            walkToHabal + habalToJeepney + jeepneyRide + walkFromJeepney;
+        final totalDistance = walkToHabal +
+            habalToJeepney +
+            jeepneyRideDistance +
+            walkFromJeepney;
         final habalFare = calculateHabalFare(habalToJeepney);
-        final jeepneyFare = calculateJeepneyFare(jeepneyRide);
         final totalFare = habalFare + jeepneyFare;
         final score = calculateRouteScore(totalDistance, totalFare,
             mode: "habal+jeepney");
@@ -2446,9 +2769,9 @@ class _MapScreenState extends State<MapScreen>
     _tasks.add({
       "title": "Walk to Habal",
       "shortDescription":
-          "Walk to the nearest Habal station (₱${totalFare.toStringAsFixed(0)} total).",
+          "Walk to the nearest Habal station (${formatFareRange(totalFare)} total).",
       "longDescription":
-          "Start by walking to the Habal pickup point. Total fare: ₱${habalFare.toStringAsFixed(0)} (Habal) + ₱${totalJeepneyFare.toStringAsFixed(0)} (Jeepney).",
+          "Start by walking to the Habal pickup point. Total fare: ${formatFareRange(habalFare)} (Habal) + ${formatFareRange(totalJeepneyFare)} (Jeepney).",
       "target": habalLocation,
       "radius": 15.0,
     });
@@ -2467,9 +2790,9 @@ class _MapScreenState extends State<MapScreen>
     _tasks.add({
       "title": "Ride Habal to Jeepney Stop",
       "shortDescription":
-          "Take the Habal to the jeepney pickup point (₱${habalFare.toStringAsFixed(0)}).",
+          "Take the Habal to the jeepney pickup point (${formatFareRange(habalFare)}).",
       "longDescription":
-          "Ride the Habal to reach the jeepney route. Fare: ₱${habalFare.toStringAsFixed(0)} for ${habalRideDistance.toStringAsFixed(1)}km.",
+          "Ride the Habal to reach the jeepney route. Fare: ${formatFareRange(habalFare)} for ${habalRideDistance.toStringAsFixed(1)}km.",
       "target": jeepneyPickup,
       "radius": 25.0,
     });
@@ -2509,9 +2832,9 @@ class _MapScreenState extends State<MapScreen>
       _tasks.add({
         "title": "Ride Jeepney",
         "shortDescription":
-            "Ride ${firstRoute.name} to your destination (₱${jeepneyFare.toStringAsFixed(0)}).",
+            "Ride ${firstRoute.name} to your destination (${formatFareRange(jeepneyFare)}).",
         "longDescription":
-            "Take ${firstRoute.name} until you're near your destination. Fare: ₱${jeepneyFare.toStringAsFixed(0)} for ${jeepneyRideDistance.toStringAsFixed(1)}km.",
+            "Take ${firstRoute.name} until you're near your destination. Fare: ${formatFareRange(jeepneyFare)} for ${jeepneyRideDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
         "radius": 30.0,
       });
@@ -2595,9 +2918,9 @@ class _MapScreenState extends State<MapScreen>
       _tasks.add({
         "title": "Ride ${firstRoute.name}",
         "shortDescription":
-            "Take ${firstRoute.name} to the transfer point (₱${firstLegFare.toStringAsFixed(0)}).",
+            "Take ${firstRoute.name} to the transfer point (${formatFareRange(firstLegFare)}).",
         "longDescription":
-            "Ride ${firstRoute.name} until the transfer point. Fare: ₱${firstLegFare.toStringAsFixed(0)} for ${firstLegDistance.toStringAsFixed(1)}km.",
+            "Ride ${firstRoute.name} until the transfer point. Fare: ${formatFareRange(firstLegFare)} for ${firstLegDistance.toStringAsFixed(1)}km.",
         "target": transferPointA,
         "radius": 30.0,
       });
@@ -2643,9 +2966,9 @@ class _MapScreenState extends State<MapScreen>
       _tasks.add({
         "title": "Ride ${secondRoute.name}",
         "shortDescription":
-            "Take ${secondRoute.name} to your destination (₱${secondLegFare.toStringAsFixed(0)}).",
+            "Take ${secondRoute.name} to your destination (${formatFareRange(secondLegFare)}).",
         "longDescription":
-            "Ride ${secondRoute.name} until you're near your destination. Fare: ₱${secondLegFare.toStringAsFixed(0)} for ${secondLegDistance.toStringAsFixed(1)}km.",
+            "Ride ${secondRoute.name} until you're near your destination. Fare: ${formatFareRange(secondLegFare)} for ${secondLegDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
         "radius": 30.0,
       });
@@ -2736,9 +3059,9 @@ class _MapScreenState extends State<MapScreen>
     _tasks.add({
       "title": "Walk to Habal",
       "shortDescription":
-          "Walk to the nearest Habal station (₱${habalFare.toStringAsFixed(0)}).",
+          "Walk to the nearest Habal station (${formatFareRange(habalFare)}).",
       "longDescription":
-          "Head to the Habal pickup point to start your ride. Upcoming fare: ₱${habalFare.toStringAsFixed(0)} for ${habalRideDistance.toStringAsFixed(1)}km.",
+          "Head to the Habal pickup point to start your ride. Upcoming fare: ${formatFareRange(habalFare)} for ${habalRideDistance.toStringAsFixed(1)}km.",
       "target": habalLocation,
       "radius": 30.0,
     });
@@ -2746,9 +3069,9 @@ class _MapScreenState extends State<MapScreen>
     _tasks.add({
       "title": "Ride Habal",
       "shortDescription":
-          "Ride the Habal to your destination (₱${habalFare.toStringAsFixed(0)}).",
+          "Ride the Habal to your destination (${formatFareRange(habalFare)}).",
       "longDescription":
-          "Take the Habal directly to your destination. Fare: ₱${habalFare.toStringAsFixed(0)} for ${habalRideDistance.toStringAsFixed(1)}km.",
+          "Take the Habal directly to your destination. Fare: ${formatFareRange(habalFare)} for ${habalRideDistance.toStringAsFixed(1)}km.",
       "target": destination,
       "radius": 2300.0,
     });
@@ -2757,6 +3080,81 @@ class _MapScreenState extends State<MapScreen>
     _setCurrentTask();
 
     final bounds = _boundsFromLatLngList(userToHabal);
+    if (bounds != null) {
+      mapController?.animateCamera(
+        CameraUpdate.newLatLngBounds(bounds, 50),
+      );
+    }
+  }
+
+  Future<void> _setupSikadRouteWithPolylines(
+    LatLng userLocation,
+    LatLng sikadLocation,
+    LatLng destination,
+  ) async {
+    _tasks.clear();
+
+    final sikadRideDistance = calculateDistance(
+      sikadLocation.latitude,
+      sikadLocation.longitude,
+      destination.latitude,
+      destination.longitude,
+    );
+
+    if (sikadRideDistance > 2.0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Sikad is only available up to 2km.")),
+      );
+      return;
+    }
+
+    final sikadFare = calculateSikadFare(sikadRideDistance);
+    final userToSikad = await _fetchPolyline(userLocation, sikadLocation);
+    final sikadToDest = await _fetchPolyline(sikadLocation, destination);
+
+    setState(() {
+      _polylines = {
+        Polyline(
+          polylineId: const PolylineId("user_to_sikad"),
+          color: Colors.purple,
+          width: 6,
+          points: userToSikad,
+          patterns: [PatternItem.dash(20), PatternItem.gap(10)],
+        ),
+        Polyline(
+          polylineId: const PolylineId("sikad_to_dest"),
+          color: Colors.deepPurple,
+          width: 6,
+          points: sikadToDest,
+        ),
+      };
+    });
+
+    _tasks.addAll([
+      {
+        "title": "Walk to Sikad",
+        "shortDescription":
+            "Walk to the nearest Sikad (${formatFareRange(sikadFare)}).",
+        "longDescription":
+            "Head to the Sikad pickup point. Upcoming fare: ${formatFareRange(sikadFare)} for ${sikadRideDistance.toStringAsFixed(1)}km.",
+        "target": sikadLocation,
+        "radius": 20.0,
+      },
+      {
+        "title": "Ride Sikad",
+        "shortDescription":
+            "Ride the Sikad to your destination (${formatFareRange(sikadFare)}).",
+        "longDescription":
+            "Take the Sikad directly to your destination. Fare: ${formatFareRange(sikadFare)} for ${sikadRideDistance.toStringAsFixed(1)}km.",
+        "target": destination,
+        "radius": 20.0,
+      },
+    ]);
+
+    _currentTaskIndex = 0;
+    _setCurrentTask();
+
+    final bounds = _boundsFromLatLngList(userToSikad);
     if (bounds != null) {
       mapController?.animateCamera(
         CameraUpdate.newLatLngBounds(bounds, 50),
@@ -2841,9 +3239,9 @@ class _MapScreenState extends State<MapScreen>
     _tasks.add({
       "title": "Walk to Jeepney Stop",
       "shortDescription":
-          "Walk to the nearest pickup point for ${firstRoute.name} (₱${totalJeepneyFare.toStringAsFixed(0)}).",
+          "Walk to the nearest pickup point for ${firstRoute.name} (${formatFareRange(totalJeepneyFare)}).",
       "longDescription":
-          "Walk to ${firstRoute.name}'s pickup location to start your journey. Upcoming fare: ₱${totalJeepneyFare.toStringAsFixed(0)} $fareDescription.",
+          "Walk to ${firstRoute.name}'s pickup location to start your journey. Upcoming fare: ${formatFareRange(totalJeepneyFare)} $fareDescription.",
       "target": startPoint,
       "radius": 30.0,
     });
@@ -2882,9 +3280,9 @@ class _MapScreenState extends State<MapScreen>
       _tasks.add({
         "title": "Ride Jeepney",
         "shortDescription":
-            "Ride ${firstRoute.name} to reach near your destination (₱${jeepneyFare.toStringAsFixed(0)}).",
+            "Ride ${firstRoute.name} to reach near your destination (${formatFareRange(jeepneyFare)}).",
         "longDescription":
-            "Stay on ${firstRoute.name} until you're close to your destination. Fare: ₱${jeepneyFare.toStringAsFixed(0)} for ${jeepneyRideDistance.toStringAsFixed(1)}km.",
+            "Stay on ${firstRoute.name} until you're close to your destination. Fare: ${formatFareRange(jeepneyFare)} for ${jeepneyRideDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
         "radius": 30.0,
       });
@@ -2969,9 +3367,9 @@ class _MapScreenState extends State<MapScreen>
       _tasks.add({
         "title": "Ride ${firstRoute.name}",
         "shortDescription":
-            "Ride ${firstRoute.name} to the transfer point (₱${firstLegFare.toStringAsFixed(0)}).",
+            "Ride ${firstRoute.name} to the transfer point (${formatFareRange(firstLegFare)}).",
         "longDescription":
-            "Take ${firstRoute.name} until the transfer point for your next jeepney. Fare: ₱${firstLegFare.toStringAsFixed(0)} for ${firstLegDistance.toStringAsFixed(1)}km.",
+            "Take ${firstRoute.name} until the transfer point for your next jeepney. Fare: ${formatFareRange(firstLegFare)} for ${firstLegDistance.toStringAsFixed(1)}km.",
         "target": transferPointA, // ✅ actual exit point on Route A
         "radius": 30.0,
       });
@@ -3018,9 +3416,9 @@ class _MapScreenState extends State<MapScreen>
       _tasks.add({
         "title": "Ride ${secondRoute.name}",
         "shortDescription":
-            "Ride ${secondRoute.name} near your destination (₱${secondLegFare.toStringAsFixed(0)}).",
+            "Ride ${secondRoute.name} near your destination (${formatFareRange(secondLegFare)}).",
         "longDescription":
-            "Ride ${secondRoute.name} close to your destination stop. Fare: ₱${secondLegFare.toStringAsFixed(0)} for ${secondLegDistance.toStringAsFixed(1)}km.",
+            "Ride ${secondRoute.name} close to your destination stop. Fare: ${formatFareRange(secondLegFare)} for ${secondLegDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
         "radius": 30.0,
       });
@@ -3103,7 +3501,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription":
             "Walk to the nearest pickup point for ${firstRoute.name}.",
         "longDescription":
-            "Walk to ${firstRoute.name}’s pickup location to start your journey. \n\n Upcoming Fare: ₱${jeepneyFare.toStringAsFixed(0)}",
+            "Walk to ${firstRoute.name}’s pickup location to start your journey. \n\n Upcoming Fare: ${formatFareRange(jeepneyFare)}",
         "target": startPoint,
       });
 
@@ -3113,7 +3511,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription":
             "Ride ${firstRoute.name} to reach near your destination.",
         "longDescription":
-            "Stay on ${firstRoute.name} until you’re close to your destination. \n\nFare: ₱${jeepneyFare.toStringAsFixed(0)}\n Distance:${jeepneyRideDistance.toStringAsFixed(1)}km.",
+            "Stay on ${firstRoute.name} until you’re close to your destination. \n\nFare: ${formatFareRange(jeepneyFare)}\n Distance:${jeepneyRideDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
       });
 
@@ -3169,7 +3567,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription":
             "Walk to the nearest pickup point for ${firstRoute.name}.",
         "longDescription":
-            "Start by walking to ${firstRoute.name}’s pickup stop.\n\n Upcoming Fare: ₱${totalFare.toStringAsFixed(0)} (₱${firstJeepneyFare.toStringAsFixed(0)} for ${firstRouteDistance.toStringAsFixed(1)}km + ₱${secondJeepneyFare.toStringAsFixed(0)} for ${secondRouteDistance.toStringAsFixed(1)}km)",
+            "Start by walking to ${firstRoute.name}’s pickup stop.\n\n Upcoming Fare: ${formatFareRange(totalFare)} (₱${firstJeepneyFare.toStringAsFixed(0)} for ${firstRouteDistance.toStringAsFixed(1)}km + ₱${secondJeepneyFare.toStringAsFixed(0)} for ${secondRouteDistance.toStringAsFixed(1)}km)",
         "target": startPoint,
       });
 
@@ -3177,7 +3575,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Ride First Jeepney",
         "shortDescription": "Ride ${firstRoute.name} to the transfer point.",
         "longDescription":
-            "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\n Fare: ₱${firstJeepneyFare.toStringAsFixed(0)}\n Distance: ${firstRouteDistance.toStringAsFixed(1)}km.",
+            "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\n Fare: ${formatFareRange(firstJeepneyFare)}\n Distance: ${firstRouteDistance.toStringAsFixed(1)}km.",
         "target": transferPointA,
       });
 
@@ -3185,7 +3583,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Transfer Jeepney",
         "shortDescription": "Transfer to ${secondRoute.name}.",
         "longDescription":
-            "Switch to ${secondRoute.name} to continue your journey.\n\n Upcoming Fare: ₱${secondJeepneyFare.toStringAsFixed(0)}",
+            "Switch to ${secondRoute.name} to continue your journey.\n\n Upcoming Fare: ${formatFareRange(secondJeepneyFare)}",
         "target": transferPointB,
       });
 
@@ -3193,7 +3591,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Ride Second Jeepney",
         "shortDescription": "Ride ${secondRoute.name} near your destination.",
         "longDescription":
-            "Ride ${secondRoute.name} close to your destination stop. \n\nFare: ₱${secondJeepneyFare.toStringAsFixed(0)}\n Distance: ${secondRouteDistance.toStringAsFixed(1)}km.",
+            "Ride ${secondRoute.name} close to your destination stop. \n\nFare: ${formatFareRange(secondJeepneyFare)}\n Distance: ${secondRouteDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
       });
 
@@ -3249,7 +3647,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription":
             "Walk to the nearest pickup point for ${firstRoute.name}.",
         "longDescription":
-            "Walk to ${firstRoute.name}'s pickup location to start your journey.\n\nUpcoming Fare: ₱${jeepneyFare.toStringAsFixed(0)}",
+            "Walk to ${firstRoute.name}'s pickup location to start your journey.\n\nUpcoming Fare: ${formatFareRange(jeepneyFare)}",
         "target": startPoint,
       });
 
@@ -3258,7 +3656,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription":
             "Ride ${firstRoute.name} to reach near your destination.",
         "longDescription":
-            "Stay on ${firstRoute.name} until you're close to your destination.\n\nFare: ₱${jeepneyFare.toStringAsFixed(0)}\nDistance: ${jeepneyRideDistance.toStringAsFixed(1)}km.",
+            "Stay on ${firstRoute.name} until you're close to your destination.\n\nFare: ${formatFareRange(jeepneyFare)}\nDistance: ${jeepneyRideDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
       });
 
@@ -3309,7 +3707,7 @@ class _MapScreenState extends State<MapScreen>
         "shortDescription":
             "Walk to the nearest pickup point for ${firstRoute.name}.",
         "longDescription":
-            "Start by walking to ${firstRoute.name}'s pickup stop.\n\nUpcoming Fare: ₱${totalFare.toStringAsFixed(0)} (₱${firstJeepneyFare.toStringAsFixed(0)} for ${firstRouteDistance.toStringAsFixed(1)}km + ₱${secondJeepneyFare.toStringAsFixed(0)} for ${secondRouteDistance.toStringAsFixed(1)}km)",
+            "Start by walking to ${firstRoute.name}'s pickup stop.\n\nUpcoming Fare: ${formatFareRange(totalFare)} (₱${firstJeepneyFare.toStringAsFixed(0)} for ${firstRouteDistance.toStringAsFixed(1)}km + ₱${secondJeepneyFare.toStringAsFixed(0)} for ${secondRouteDistance.toStringAsFixed(1)}km)",
         "target": startPoint,
       });
 
@@ -3317,7 +3715,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Ride First Jeepney",
         "shortDescription": "Ride ${firstRoute.name} to the transfer point.",
         "longDescription":
-            "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\nFare: ₱${firstJeepneyFare.toStringAsFixed(0)}\nDistance: ${firstRouteDistance.toStringAsFixed(1)}km.",
+            "Take ${firstRoute.name} until the transfer point for your next jeepney.\n\nFare: ${formatFareRange(firstJeepneyFare)}\nDistance: ${firstRouteDistance.toStringAsFixed(1)}km.",
         "target": transferPointA,
       });
 
@@ -3325,7 +3723,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Transfer Jeepney",
         "shortDescription": "Transfer to ${secondRoute.name}.",
         "longDescription":
-            "Switch to ${secondRoute.name} to continue your journey.\n\nUpcoming Fare: ₱${secondJeepneyFare.toStringAsFixed(0)}",
+            "Switch to ${secondRoute.name} to continue your journey.\n\nUpcoming Fare: ${formatFareRange(secondJeepneyFare)}",
         "target": transferPointB,
       });
 
@@ -3333,7 +3731,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Ride Second Jeepney",
         "shortDescription": "Ride ${secondRoute.name} near your destination.",
         "longDescription":
-            "Ride ${secondRoute.name} close to your destination stop.\n\nFare: ₱${secondJeepneyFare.toStringAsFixed(0)}\nDistance: ${secondRouteDistance.toStringAsFixed(1)}km.",
+            "Ride ${secondRoute.name} close to your destination stop.\n\nFare: ${formatFareRange(secondJeepneyFare)}\nDistance: ${secondRouteDistance.toStringAsFixed(1)}km.",
         "target": nearestToDest,
       });
 
@@ -3376,7 +3774,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Walk",
         "shortDescription": "Walk to the nearest Habal marker.",
         "longDescription":
-            "Follow the suggested path on the map to reach the nearest Habal station. Once you arrive, your next task will start automatically. \n\n Upcoming Fare: ₱${fare.toStringAsFixed(0)}",
+            "Follow the suggested path on the map to reach the nearest Habal station. Once you arrive, your next task will start automatically. \n\n Upcoming Fare: ${formatFareRange(fare)}",
         "target": nearestHabal,
         "radius": 15.0,
       },
@@ -3384,7 +3782,7 @@ class _MapScreenState extends State<MapScreen>
         "title": "Ride",
         "shortDescription": "Ride the Habal until you reach your destination.",
         "longDescription":
-            "Stay on the Habal until you reach your destination marker. You can monitor your progress in real-time. \n\n Fare: ₱${fare.toStringAsFixed(0)} \nDistance: ${distance.toStringAsFixed(1)}km.",
+            "Stay on the Habal until you reach your destination marker. You can monitor your progress in real-time. \n\n Fare: ${formatFareRange(fare)} \nDistance: ${distance.toStringAsFixed(1)}km.",
         "target": destination,
         "radius": 20.0,
       },
@@ -3611,7 +4009,8 @@ class _MapScreenState extends State<MapScreen>
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                      builder: (context) => const SettingsScreen()),
+                      builder: (context) => SettingsScreen(
+                          isAdmin: _currentUser?.isAdmin ?? false)),
                 );
               },
               onLogout: _handleLogout,
@@ -4228,7 +4627,7 @@ class _MapScreenState extends State<MapScreen>
                           final jeepFare = calculateJeepneyFare(dist);
                           final habalFare = calculateHabalFare(dist);
                           return Text(
-                            'Est. fare: Jeepney ₱${jeepFare.toStringAsFixed(0)} · Habal ₱${habalFare.toStringAsFixed(0)} · ${dist.toStringAsFixed(1)}km',
+                            'Est. fare: Jeepney ${formatFareRange(jeepFare)} · Habal ${formatFareRange(habalFare)} · ${dist.toStringAsFixed(1)}km',
                             style: const TextStyle(
                               fontSize: 13,
                               fontWeight: FontWeight.w600,

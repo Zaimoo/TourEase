@@ -9,6 +9,11 @@ class Trip {
   final double? distance;
   final String? transportMode;
 
+  /// True only if the user's GPS position was confirmed inside the
+  /// destination geofence (and not mocked) when the trip completed.
+  /// Reviews are gated on this flag to prevent paid/remote reviews.
+  final bool verifiedOnSite;
+
   Trip({
     required this.id,
     required this.destinationName,
@@ -17,6 +22,7 @@ class Trip {
     this.imageUrl,
     this.distance,
     this.transportMode,
+    this.verifiedOnSite = false,
   });
 
   factory Trip.fromJson(Map<String, dynamic> json, String id) {
@@ -28,6 +34,14 @@ class Trip {
       imageUrl: json['imageUrl'],
       distance: json['distance']?.toDouble(),
       transportMode: json['transportMode'],
+      // Trips recorded before on-site verification existed have no
+      // `verifiedOnSite` field at all. Grandfather those legacy trips as
+      // verified so existing users aren't locked out of reviewing. New trips
+      // always write the field explicitly, so a present `false` is a real
+      // failed on-site check and still correctly blocks reviewing.
+      verifiedOnSite: json.containsKey('verifiedOnSite')
+          ? (json['verifiedOnSite'] ?? false)
+          : true,
     );
   }
 
@@ -39,6 +53,7 @@ class Trip {
       'imageUrl': imageUrl,
       'distance': distance,
       'transportMode': transportMode,
+      'verifiedOnSite': verifiedOnSite,
     };
   }
 }

@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:tourease/services/use_auth.dart';
+import 'package:tourease/view/fare_admin_screen.dart';
 import 'package:tourease/view/jeepney_routes_screen.dart';
 import 'package:tourease/view/login_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
-  const SettingsScreen({super.key});
+  /// Whether the signed-in user is an admin. Admin-only entries (fare
+  /// management, debug tools) are hidden when false.
+  final bool isAdmin;
+
+  const SettingsScreen({super.key, this.isAdmin = false});
 
   void _showLogoutConfirmation(BuildContext context) {
     showDialog(
@@ -122,16 +127,28 @@ class SettingsScreen extends StatelessWidget {
           _buildSettingItem(Icons.lock_outline, "Privacy"),
           _buildSettingItem(Icons.language, "Language"),
           _buildSettingItem(Icons.help_outline, "Help & Support"),
-          const Divider(),
-          _buildSettingItem(
-            Icons.bug_report,
-            "DEBUG: ROUTE VIEWER",
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const JeepneyRoutesScreen()),
-              );
-            },
-          ),
+          if (isAdmin) ...[
+            const Divider(),
+            _buildSettingItem(
+              Icons.bug_report,
+              "DEBUG: ROUTE VIEWER",
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                      builder: (_) => const JeepneyRoutesScreen()),
+                );
+              },
+            ),
+            _buildSettingItem(
+              Icons.payments_outlined,
+              "Manage Fares (Admin)",
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const FareAdminScreen()),
+                );
+              },
+            ),
+          ],
           _buildSettingItem(Icons.info_outline, "About App"),
           const SizedBox(height: 8),
           Card(

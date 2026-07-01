@@ -50,10 +50,13 @@ class _AllReviewsScreenState extends State<AllReviewsScreen> {
         widget.currentUser.id,
         'trips',
       );
+      // Require an on-site-verified trip, not just any trip, so reviews can
+      // only come from users whose GPS was confirmed at the destination.
       final visited = trips.any(
         (trip) =>
+            trip.verifiedOnSite &&
             trip.destinationName.toLowerCase() ==
-            widget.destinationName.toLowerCase(),
+                widget.destinationName.toLowerCase(),
       );
       setState(() {
         _hasVisited = visited;
@@ -68,11 +71,18 @@ class _AllReviewsScreenState extends State<AllReviewsScreen> {
   }
 
   Stream<List<Review>> getReviews() {
-    return reviewService.streamAll('reviews').map(
-          (reviews) => reviews
-              .where((r) => r.destination == widget.destinationName)
-              .toList(),
-        );
+    return reviewService
+        .streamWhere(
+          'reviews',
+          (ref) =>
+              ref.where('destination', isEqualTo: widget.destinationName),
+        )
+        .map((reviews) {
+      // Newest first; legacy reviews without a timestamp sort last.
+      reviews.sort((a, b) => (b.createdAt ?? DateTime(0))
+          .compareTo(a.createdAt ?? DateTime(0)));
+      return reviews;
+    });
   }
 
   void _showVisitRequiredDialog() {
@@ -88,8 +98,9 @@ class _AllReviewsScreenState extends State<AllReviewsScreen> {
           ],
         ),
         content: const Text(
-          'You can only review places you\'ve visited.\n\n'
-          'Navigate to this destination first and complete your trip to unlock the review feature.',
+          'You can only review places you\'ve visited in person.\n\n'
+          'Navigate to this destination and arrive on-site (your location is '
+          'verified by GPS) to unlock the review feature.',
         ),
         actions: [
           ElevatedButton(
@@ -153,6 +164,8 @@ class _AllReviewsScreenState extends State<AllReviewsScreen> {
                   rating: review.rating,
                   // 3. Pass the determined URL to the ReviewCard.
                   profileUrl: imageUrl,
+                  verified: review.verified,
+                  photoUrls: review.photoUrls,
                 ),
               );
             },

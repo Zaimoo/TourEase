@@ -1,7 +1,8 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_rating_bar/flutter_rating_bar.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:tourease/models/user.dart';
 import '../models/review.dart';
@@ -57,6 +58,36 @@ class _AddReviewScreenState extends State<AddReviewScreen> {
     });
   }
 
+  /// Uploads the selected photos to Cloudinary and returns their secure URLs.
+  /// Mirrors the upload flow used for profile photos in EditProfileScreen.
+  Future<List<String>> _uploadImages() async {
+    const cloudName = "dlhcqfdzk";
+    const uploadPreset = "flutter_uploads";
+
+    final uri =
+        Uri.parse("https://api.cloudinary.com/v1_1/$cloudName/image/upload");
+    final urls = <String>[];
+
+    for (final image in _selectedImages) {
+      final request = http.MultipartRequest('POST', uri)
+        ..fields['upload_preset'] = uploadPreset
+        ..files.add(await http.MultipartFile.fromPath('file', image.path));
+
+      final response = await request.send();
+      final responseData = await response.stream.bytesToString();
+      if (response.statusCode != 200) {
+        throw Exception('Image upload failed (${response.statusCode})');
+      }
+      final url = (json.decode(responseData) as Map)['secure_url'] as String?;
+      if (url == null) {
+        throw Exception('Image upload returned no URL');
+      }
+      urls.add(url);
+    }
+
+    return urls;
+  }
+
   Future<void> _submitReview() async {
     if (_rating == 0 || _reviewController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -67,24 +98,42 @@ class _AddReviewScreenState extends State<AddReviewScreen> {
 
     setState(() => _isSubmitting = true);
 
-    final review = Review(
-      id: '',
-      name: widget.currentUser.name,
-      email: widget.currentUser.email,
-      title: _titleController.text.isEmpty ? 'Untitled' : _titleController.text,
-      review: _reviewController.text,
-      rating: _rating,
-      destination: widget.destination,
-      profileUrl: widget.currentUser.profileUrl,
-    );
+    try {
+      // Photos are optional attachments; they no longer auto-verify the review.
+      // Every new review starts pending until an admin approves it.
+      final photoUrls = await _uploadImages();
 
-    await reviewService.add('reviews', review);
+      final review = Review(
+        id: '',
+        name: widget.currentUser.name,
+        email: widget.currentUser.email,
+        title:
+            _titleController.text.isEmpty ? 'Untitled' : _titleController.text,
+        review: _reviewController.text,
+        rating: _rating,
+        destination: widget.destination,
+        profileUrl: widget.currentUser.profileUrl,
+        photoUrls: photoUrls,
+        createdAt: DateTime.now(),
+        // status defaults to pending inside the Review model.
+      );
 
-    setState(() => _isSubmitting = false);
-    Navigator.pop(context);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("Review submitted successfully!")),
-    );
+      await reviewService.add('reviews', review);
+
+      if (!mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Review submitted — pending admin verification."),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isSubmitting = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Failed to submit review: $e")),
+      );
+    }
   }
 
   @override
@@ -184,6 +233,19 @@ class _AddReviewScreenState extends State<AddReviewScreen> {
                   fontWeight: FontWeight.w600,
                   color: Colors.grey[700],
                 ),
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Icon(Icons.info_outline, size: 16, color: Colors.grey[600]),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'Reviews are verified by an admin after submission.',
+                      style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 10),
               SizedBox(

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:tourease/services/use_auth.dart';
@@ -127,8 +128,14 @@ class _DestinationCardState extends State<DestinationCard> {
 
     try {
       final response = await http.get(Uri.parse(url));
+      print(
+          "🗺️ Directions status=${response.statusCode} for ${origin.latitude},${origin.longitude} -> ${destination.latitude},${destination.longitude}");
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        final status = data['status'];
+        final routeCount =
+            data['routes'] is List ? (data['routes'] as List).length : 0;
+        print("🧭 Directions result status=$status routes=$routeCount");
         if (data['routes'].isNotEmpty) {
           final distanceMeters =
               data['routes'][0]['legs'][0]['distance']['value'];
@@ -145,12 +152,23 @@ class _DestinationCardState extends State<DestinationCard> {
     try {
       final distance =
           await _getDistanceInKm(widget.userLocation, widget.coordinates);
+      final resolvedDistance = distance ??
+          (Geolocator.distanceBetween(
+                widget.userLocation.latitude,
+                widget.userLocation.longitude,
+                widget.coordinates.latitude,
+                widget.coordinates.longitude,
+              ) /
+              1000.0);
+      final source = distance != null ? "google" : "geolocator";
       if (mounted) {
         setState(() {
-          _distanceKm = distance;
+          _distanceKm = resolvedDistance;
           _isLoading = false;
         });
       }
+      print(
+          "📏 ${widget.name}: ${resolvedDistance.toStringAsFixed(2)}km ($source)");
     } catch (e) {
       print("❌ Error getting distance: $e");
       if (mounted) {
